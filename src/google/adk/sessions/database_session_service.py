@@ -415,7 +415,7 @@ class DatabaseSessionService(BaseSessionService):
     local_timezone = get_localzone()
     logger.info("Local timezone: %s", local_timezone)
 
-    self.db_engine = db_engine
+    self.db_engine: Engine = db_engine
     self.metadata: MetaData = MetaData()
     self.inspector = inspect(self.db_engine)
 
