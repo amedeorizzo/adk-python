@@ -27,6 +27,7 @@ from typing_extensions import override
 
 from . import _session_util
 from ..events.event import Event
+from ..events.event_actions import EventActions
 from ._session_util import extract_state_delta
 from ._session_util import merge_state
 from .base_session_service import BaseSessionService
@@ -55,14 +56,18 @@ EVENTS_SCHEMA = {
     "name": "events",
     "enable_nested_fields": True,
     "fields": [
-        {"name": "id", "type": "string"},
+        {"name": "event_id", "type": "string"},  # Dedicated event ID field
         {"name": "app_name", "type": "string"},
         {"name": "user_id", "type": "string"},
         {"name": "session_id", "type": "string"},
         {"name": "composite_key", "type": "string"},  # Unique document ID
         {"name": "invocation_id", "type": "string"},
         {"name": "author", "type": "string"},
-        {"name": "actions", "type": "string", "optional": True},  # Pickled and base64 encoded
+        {
+            "name": "actions",
+            "type": "string",
+            "optional": True,
+        },  # Pickled and base64 encoded
         {
             "name": "long_running_tool_ids_json",
             "type": "string",
@@ -186,11 +191,15 @@ class TypesenseSessionService(BaseSessionService):
     """Converts microseconds to Unix timestamp."""
     return microseconds / 1_000_000
 
-  def _serialize_actions(self, actions: Optional[EventActions]) -> Optional[str]:
+  def _serialize_actions(
+      self, actions: Optional[EventActions]
+  ) -> Optional[str]:
     """Serializes EventActions to a JSON string."""
     return actions.model_dump_json() if actions else None
 
-  def _deserialize_actions(self, actions_str: Optional[str]) -> Optional[EventActions]:
+  def _deserialize_actions(
+      self, actions_str: Optional[str]
+  ) -> Optional[EventActions]:
     """Deserializes EventActions from a JSON string."""
     if not actions_str:
       return None
@@ -389,36 +398,52 @@ class TypesenseSessionService(BaseSessionService):
   async def list_sessions(
       self, *, app_name: str, user_id: str
   ) -> ListSessionsResponse:
-    """Lists all sessions for a user."""
-    # Search for sessions
-    search_results = self.client.collections["sessions"].documents.search({
-        "q": "*",
-        "filter_by": f"app_name:={app_name} && user_id:={user_id}",
-        "per_page": 250,  # Typesense default max
-    })
-
-    # Fetch states
+    """Lists all sessions for a user with pagination support."""
+    # Fetch states once
     app_state = self._get_app_state(app_name)
     user_state = self._get_user_state(app_name, user_id)
 
     sessions = []
-    for hit in search_results["hits"]:
-      session_doc = hit["document"]
-      session_state = session_doc["state"]
-      merged_state = merge_state(app_state, user_state, session_state)
+    page = 1
+    per_page = 250  # Typesense max
 
-      sessions.append(
-          Session(
-              app_name=app_name,
-              user_id=user_id,
-              id=session_doc["session_id"],
-              state=merged_state,
-              events=[],
-              last_update_time=self._from_microseconds(
-                  session_doc["update_time"]
-              ),
-          )
-      )
+    while True:
+      # Search for sessions with pagination
+      search_results = self.client.collections["sessions"].documents.search({
+          "q": "*",
+          "filter_by": f"app_name:={app_name} && user_id:={user_id}",
+          "per_page": per_page,
+          "page": page,
+      })
+
+      # Break if no results found
+      if not search_results["hits"]:
+        break
+
+      # Process results
+      for hit in search_results["hits"]:
+        session_doc = hit["document"]
+        session_state = session_doc["state"]
+        merged_state = merge_state(app_state, user_state, session_state)
+
+        sessions.append(
+            Session(
+                app_name=app_name,
+                user_id=user_id,
+                id=session_doc["session_id"],
+                state=merged_state,
+                events=[],
+                last_update_time=self._from_microseconds(
+                    session_doc["update_time"]
+                ),
+            )
+        )
+
+      # Check if there are more pages
+      if len(search_results["hits"]) < per_page:
+        break
+
+      page += 1
 
     return ListSessionsResponse(sessions=sessions)
 
@@ -531,6 +556,7 @@ class TypesenseSessionService(BaseSessionService):
     """Converts an Event object to a Typesense document."""
     doc = {
         "id": composite_key,
+        "event_id": event.id,  # Store event ID explicitly
         "composite_key": composite_key,
         "app_name": session.app_name,
         "user_id": session.user_id,
@@ -583,11 +609,11 @@ class TypesenseSessionService(BaseSessionService):
       long_running_tool_ids = set(json.loads(doc["long_running_tool_ids_json"]))
 
     return Event(
-        id=doc["id"].split(":")[0],  # Extract event ID from composite key
+        id=doc["event_id"],  # Read from dedicated event_id field
         invocation_id=doc["invocation_id"],
         author=doc["author"],
         branch=doc.get("branch"),
-        actions=self._deserialize_actions(doc["actions"]),
+        actions=self._deserialize_actions(doc.get("actions")),
         timestamp=self._from_microseconds(doc["timestamp"]),
         content=_session_util.decode_content(doc.get("content")),
         long_running_tool_ids=long_running_tool_ids,
