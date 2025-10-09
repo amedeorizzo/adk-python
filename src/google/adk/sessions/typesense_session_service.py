@@ -186,13 +186,15 @@ class TypesenseSessionService(BaseSessionService):
     """Converts microseconds to Unix timestamp."""
     return microseconds / 1_000_000
 
-  def _serialize_actions(self, actions: Any) -> str:
-    """Pickles and base64 encodes actions."""
-    return base64.b64encode(pickle.dumps(actions)).decode("ascii")
+  def _serialize_actions(self, actions: Optional[EventActions]) -> Optional[str]:
+    """Serializes EventActions to a JSON string."""
+    return actions.model_dump_json() if actions else None
 
-  def _deserialize_actions(self, actions_str: str) -> Any:
-    """Base64 decodes and unpickles actions."""
-    return pickle.loads(base64.b64decode(actions_str))
+  def _deserialize_actions(self, actions_str: Optional[str]) -> Optional[EventActions]:
+    """Deserializes EventActions from a JSON string."""
+    if not actions_str:
+      return None
+    return EventActions.model_validate_json(actions_str)
 
   def _get_app_state(self, app_name: str) -> dict[str, Any]:
     """Fetches app state from Typesense."""
