@@ -62,7 +62,7 @@ EVENTS_SCHEMA = {
         {"name": "composite_key", "type": "string"},  # Unique document ID
         {"name": "invocation_id", "type": "string"},
         {"name": "author", "type": "string"},
-        {"name": "actions", "type": "string"},  # Pickled and base64 encoded
+        {"name": "actions", "type": "string", "optional": True},  # Pickled and base64 encoded
         {
             "name": "long_running_tool_ids_json",
             "type": "string",
