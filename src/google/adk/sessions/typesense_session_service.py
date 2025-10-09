@@ -21,6 +21,7 @@ import pickle
 from typing import Any
 from typing import Optional
 import uuid
+import json
 
 import typesense
 from typing_extensions import override
@@ -569,7 +570,6 @@ class TypesenseSessionService(BaseSessionService):
 
     # Add optional fields
     if event.long_running_tool_ids:
-      import json
 
       doc["long_running_tool_ids_json"] = json.dumps(
           list(event.long_running_tool_ids)
@@ -599,7 +599,6 @@ class TypesenseSessionService(BaseSessionService):
 
   def _document_to_event(self, doc: dict[str, Any]) -> Event:
     """Converts a Typesense document to an Event object."""
-    import json
 
     long_running_tool_ids = set()
     if (
