@@ -53,6 +53,8 @@ from tzlocal import get_localzone
 
 from . import _session_util
 from ..events.event import Event
+from ._session_util import extract_state_delta
+from ._session_util import merge_state
 from .base_session_service import BaseSessionService
 from .base_session_service import GetSessionConfig
 from .base_session_service import ListSessionsResponse
@@ -413,7 +415,7 @@ class DatabaseSessionService(BaseSessionService):
     local_timezone = get_localzone()
     logger.info("Local timezone: %s", local_timezone)
 
-    self.db_engine: Engine = db_engine
+    self.db_engine = db_engine
     self.metadata: MetaData = MetaData()
     self.inspector = inspect(self.db_engine)
 
@@ -463,7 +465,7 @@ class DatabaseSessionService(BaseSessionService):
         sql_session.add(storage_user_state)
 
       # Extract state deltas
-      app_state_delta, user_state_delta, session_state = _extract_state_delta(
+      app_state_delta, user_state_delta, session_state = extract_state_delta(
           state
       )
 
@@ -490,7 +492,7 @@ class DatabaseSessionService(BaseSessionService):
       sql_session.refresh(storage_session)
 
       # Merge states for response
-      merged_state = _merge_state(app_state, user_state, session_state)
+      merged_state = merge_state(app_state, user_state, session_state)
       session = storage_session.to_session(state=merged_state)
     return session
 
@@ -545,7 +547,7 @@ class DatabaseSessionService(BaseSessionService):
       session_state = storage_session.state
 
       # Merge states
-      merged_state = _merge_state(app_state, user_state, session_state)
+      merged_state = merge_state(app_state, user_state, session_state)
 
       # Convert storage session to session
       events = [e.to_event() for e in reversed(storage_events)]
@@ -576,7 +578,7 @@ class DatabaseSessionService(BaseSessionService):
       sessions = []
       for storage_session in results:
         session_state = storage_session.state
-        merged_state = _merge_state(app_state, user_state, session_state)
+        merged_state = merge_state(app_state, user_state, session_state)
 
         sessions.append(storage_session.to_session(state=merged_state))
       return ListSessionsResponse(sessions=sessions)
@@ -633,7 +635,7 @@ class DatabaseSessionService(BaseSessionService):
       if event.actions:
         if event.actions.state_delta:
           app_state_delta, user_state_delta, session_state_delta = (
-              _extract_state_delta(event.actions.state_delta)
+              extract_state_delta(event.actions.state_delta)
           )
 
       # Merge state and update storage
@@ -658,28 +660,3 @@ class DatabaseSessionService(BaseSessionService):
     # Also update the in-memory session
     await super().append_event(session=session, event=event)
     return event
-
-
-def _extract_state_delta(state: dict[str, Any]):
-  app_state_delta = {}
-  user_state_delta = {}
-  session_state_delta = {}
-  if state:
-    for key in state.keys():
-      if key.startswith(State.APP_PREFIX):
-        app_state_delta[key.removeprefix(State.APP_PREFIX)] = state[key]
-      elif key.startswith(State.USER_PREFIX):
-        user_state_delta[key.removeprefix(State.USER_PREFIX)] = state[key]
-      elif not key.startswith(State.TEMP_PREFIX):
-        session_state_delta[key] = state[key]
-  return app_state_delta, user_state_delta, session_state_delta
-
-
-def _merge_state(app_state, user_state, session_state):
-  # Merge states for response
-  merged_state = copy.deepcopy(session_state)
-  for key in app_state.keys():
-    merged_state[State.APP_PREFIX + key] = app_state[key]
-  for key in user_state.keys():
-    merged_state[State.USER_PREFIX + key] = user_state[key]
-  return merged_state

@@ -39,3 +39,13 @@ except ImportError:
       'DatabaseSessionService require sqlalchemy>=2.0, please ensure it is'
       ' installed correctly.'
   )
+
+try:
+  from .typesense_session_service import TypesenseSessionService
+
+  __all__.append('TypesenseSessionService')
+except ImportError:
+  logger.debug(
+      'TypesenseSessionService requires typesense>=1.1.1, please ensure it is'
+      ' installed correctly.'
+  )
