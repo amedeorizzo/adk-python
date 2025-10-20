@@ -23,6 +23,7 @@ from typing import Any
 from typing import Optional
 import uuid
 
+from google.genai import types
 from sqlalchemy import Boolean
 from sqlalchemy import delete
 from sqlalchemy import Dialect
@@ -114,6 +115,8 @@ class DynamicPickleType(TypeDecorator):
   impl = PickleType
 
   def load_dialect_impl(self, dialect):
+    if dialect.name == "mysql":
+      return dialect.type_descriptor(mysql.LONGBLOB)
     if dialect.name == "spanner+spanner":
       from google.cloud.sqlalchemy_spanner.sqlalchemy_spanner import SpannerPickleType
 
@@ -252,6 +255,12 @@ class StorageEvent(Base):
   custom_metadata: Mapped[dict[str, Any]] = mapped_column(
       DynamicJSON, nullable=True
   )
+  usage_metadata: Mapped[dict[str, Any]] = mapped_column(
+      DynamicJSON, nullable=True
+  )
+  citation_metadata: Mapped[dict[str, Any]] = mapped_column(
+      DynamicJSON, nullable=True
+  )
 
   partial: Mapped[bool] = mapped_column(Boolean, nullable=True)
   turn_complete: Mapped[bool] = mapped_column(Boolean, nullable=True)
@@ -318,6 +327,14 @@ class StorageEvent(Base):
       )
     if event.custom_metadata:
       storage_event.custom_metadata = event.custom_metadata
+    if event.usage_metadata:
+      storage_event.usage_metadata = event.usage_metadata.model_dump(
+          exclude_none=True, mode="json"
+      )
+    if event.citation_metadata:
+      storage_event.citation_metadata = event.citation_metadata.model_dump(
+          exclude_none=True, mode="json"
+      )
     return storage_event
 
   def to_event(self) -> Event:
@@ -328,17 +345,23 @@ class StorageEvent(Base):
         branch=self.branch,
         actions=self.actions,
         timestamp=self.timestamp.timestamp(),
-        content=_session_util.decode_content(self.content),
         long_running_tool_ids=self.long_running_tool_ids,
         partial=self.partial,
         turn_complete=self.turn_complete,
         error_code=self.error_code,
         error_message=self.error_message,
         interrupted=self.interrupted,
-        grounding_metadata=_session_util.decode_grounding_metadata(
-            self.grounding_metadata
-        ),
         custom_metadata=self.custom_metadata,
+        content=_session_util.decode_model(self.content, types.Content),
+        grounding_metadata=_session_util.decode_model(
+            self.grounding_metadata, types.GroundingMetadata
+        ),
+        usage_metadata=_session_util.decode_model(
+            self.usage_metadata, types.GenerateContentResponseUsageMetadata
+        ),
+        citation_metadata=_session_util.decode_model(
+            self.citation_metadata, types.CitationMetadata
+        ),
     )
 
 
@@ -444,20 +467,14 @@ class DatabaseSessionService(BaseSessionService):
     # 5. Return the session
 
     with self.database_session_factory() as sql_session:
-
       # Fetch app and user states from storage
       storage_app_state = sql_session.get(StorageAppState, (app_name))
-      storage_user_state = sql_session.get(
-          StorageUserState, (app_name, user_id)
-      )
-
-      app_state = storage_app_state.state if storage_app_state else {}
-      user_state = storage_user_state.state if storage_user_state else {}
-
-      # Create state tables if not exist
       if not storage_app_state:
         storage_app_state = StorageAppState(app_name=app_name, state={})
         sql_session.add(storage_app_state)
+      storage_user_state = sql_session.get(
+          StorageUserState, (app_name, user_id)
+      )
       if not storage_user_state:
         storage_user_state = StorageUserState(
             app_name=app_name, user_id=user_id, state={}
@@ -465,19 +482,22 @@ class DatabaseSessionService(BaseSessionService):
         sql_session.add(storage_user_state)
 
       # Extract state deltas
+<<<<<<< HEAD
       app_state_delta, user_state_delta, session_state = extract_state_delta(
           state
       )
+=======
+      state_deltas = _session_util.extract_state_delta(state)
+      app_state_delta = state_deltas["app"]
+      user_state_delta = state_deltas["user"]
+      session_state = state_deltas["session"]
+>>>>>>> upstream/main
 
       # Apply state delta
-      app_state.update(app_state_delta)
-      user_state.update(user_state_delta)
-
-      # Store app and user state
       if app_state_delta:
-        storage_app_state.state = app_state
+        storage_app_state.state = storage_app_state.state | app_state_delta
       if user_state_delta:
-        storage_user_state.state = user_state
+        storage_user_state.state = storage_user_state.state | user_state_delta
 
       # Store the session
       storage_session = StorageSession(
@@ -492,7 +512,13 @@ class DatabaseSessionService(BaseSessionService):
       sql_session.refresh(storage_session)
 
       # Merge states for response
+<<<<<<< HEAD
       merged_state = merge_state(app_state, user_state, session_state)
+=======
+      merged_state = _merge_state(
+          storage_app_state.state, storage_user_state.state, session_state
+      )
+>>>>>>> upstream/main
       session = storage_session.to_session(state=merged_state)
     return session
 
@@ -515,19 +541,18 @@ class DatabaseSessionService(BaseSessionService):
       if storage_session is None:
         return None
 
+      query = sql_session.query(StorageEvent).filter(
+          StorageEvent.app_name == app_name,
+          StorageEvent.user_id == user_id,
+          StorageEvent.session_id == storage_session.id,
+      )
+
       if config and config.after_timestamp:
         after_dt = datetime.fromtimestamp(config.after_timestamp)
-        timestamp_filter = StorageEvent.timestamp >= after_dt
-      else:
-        timestamp_filter = True
+        query = query.filter(StorageEvent.timestamp >= after_dt)
 
       storage_events = (
-          sql_session.query(StorageEvent)
-          .filter(StorageEvent.app_name == app_name)
-          .filter(StorageEvent.session_id == storage_session.id)
-          .filter(StorageEvent.user_id == user_id)
-          .filter(timestamp_filter)
-          .order_by(StorageEvent.timestamp.desc())
+          query.order_by(StorageEvent.timestamp.desc())
           .limit(
               config.num_recent_events
               if config and config.num_recent_events
@@ -556,30 +581,47 @@ class DatabaseSessionService(BaseSessionService):
 
   @override
   async def list_sessions(
-      self, *, app_name: str, user_id: str
+      self, *, app_name: str, user_id: Optional[str] = None
   ) -> ListSessionsResponse:
     with self.database_session_factory() as sql_session:
-      results = (
-          sql_session.query(StorageSession)
-          .filter(StorageSession.app_name == app_name)
-          .filter(StorageSession.user_id == user_id)
-          .all()
+      query = sql_session.query(StorageSession).filter(
+          StorageSession.app_name == app_name
       )
+      if user_id is not None:
+        query = query.filter(StorageSession.user_id == user_id)
+      results = query.all()
 
-      # Fetch states from storage
+      # Fetch app state from storage
       storage_app_state = sql_session.get(StorageAppState, (app_name))
-      storage_user_state = sql_session.get(
-          StorageUserState, (app_name, user_id)
-      )
-
       app_state = storage_app_state.state if storage_app_state else {}
-      user_state = storage_user_state.state if storage_user_state else {}
+
+      # Fetch user state(s) from storage
+      user_states_map = {}
+      if user_id is not None:
+        storage_user_state = sql_session.get(
+            StorageUserState, (app_name, user_id)
+        )
+        if storage_user_state:
+          user_states_map[user_id] = storage_user_state.state
+      else:
+        all_user_states_for_app = (
+            sql_session.query(StorageUserState)
+            .filter(StorageUserState.app_name == app_name)
+            .all()
+        )
+        for storage_user_state in all_user_states_for_app:
+          user_states_map[storage_user_state.user_id] = storage_user_state.state
 
       sessions = []
       for storage_session in results:
         session_state = storage_session.state
+<<<<<<< HEAD
         merged_state = merge_state(app_state, user_state, session_state)
 
+=======
+        user_state = user_states_map.get(storage_session.user_id, {})
+        merged_state = _merge_state(app_state, user_state, session_state)
+>>>>>>> upstream/main
         sessions.append(storage_session.to_session(state=merged_state))
       return ListSessionsResponse(sessions=sessions)
 
@@ -627,11 +669,8 @@ class DatabaseSessionService(BaseSessionService):
           StorageUserState, (session.app_name, session.user_id)
       )
 
-      app_state = storage_app_state.state if storage_app_state else {}
-      user_state = storage_user_state.state if storage_user_state else {}
-      session_state = storage_session.state
-
       # Extract state delta
+<<<<<<< HEAD
       app_state_delta = {}
       user_state_delta = {}
       session_state_delta = {}
@@ -651,6 +690,22 @@ class DatabaseSessionService(BaseSessionService):
       if session_state_delta:
         session_state.update(session_state_delta)
         storage_session.state = session_state
+=======
+      if event.actions and event.actions.state_delta:
+        state_deltas = _session_util.extract_state_delta(
+            event.actions.state_delta
+        )
+        app_state_delta = state_deltas["app"]
+        user_state_delta = state_deltas["user"]
+        session_state_delta = state_deltas["session"]
+        # Merge state and update storage
+        if app_state_delta:
+          storage_app_state.state = storage_app_state.state | app_state_delta
+        if user_state_delta:
+          storage_user_state.state = storage_user_state.state | user_state_delta
+        if session_state_delta:
+          storage_session.state = storage_session.state | session_state_delta
+>>>>>>> upstream/main
 
       sql_session.add(StorageEvent.from_event(session, event))
 
@@ -663,3 +718,16 @@ class DatabaseSessionService(BaseSessionService):
     # Also update the in-memory session
     await super().append_event(session=session, event=event)
     return event
+<<<<<<< HEAD
+=======
+
+
+def _merge_state(app_state, user_state, session_state):
+  # Merge states for response
+  merged_state = copy.deepcopy(session_state)
+  for key in app_state.keys():
+    merged_state[State.APP_PREFIX + key] = app_state[key]
+  for key in user_state.keys():
+    merged_state[State.USER_PREFIX + key] = user_state[key]
+  return merged_state
+>>>>>>> upstream/main
