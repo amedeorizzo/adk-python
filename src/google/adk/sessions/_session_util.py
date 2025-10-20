@@ -48,3 +48,12 @@ def extract_state_delta(
       elif not key.startswith(State.TEMP_PREFIX):
         deltas["session"][key] = state[key]
   return deltas
+
+def _merge_state(app_state, user_state, session_state):
+  # Merge states for response
+  merged_state = copy.deepcopy(session_state)
+  for key in app_state.keys():
+    merged_state[State.APP_PREFIX + key] = app_state[key]
+  for key in user_state.keys():
+    merged_state[State.USER_PREFIX + key] = user_state[key]
+  return merged_state

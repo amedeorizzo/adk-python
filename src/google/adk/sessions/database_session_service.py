@@ -482,16 +482,10 @@ class DatabaseSessionService(BaseSessionService):
         sql_session.add(storage_user_state)
 
       # Extract state deltas
-<<<<<<< HEAD
-      app_state_delta, user_state_delta, session_state = extract_state_delta(
-          state
-      )
-=======
-      state_deltas = _session_util.extract_state_delta(state)
+      state_deltas = extract_state_delta(state)
       app_state_delta = state_deltas["app"]
       user_state_delta = state_deltas["user"]
       session_state = state_deltas["session"]
->>>>>>> upstream/main
 
       # Apply state delta
       if app_state_delta:
@@ -512,13 +506,9 @@ class DatabaseSessionService(BaseSessionService):
       sql_session.refresh(storage_session)
 
       # Merge states for response
-<<<<<<< HEAD
-      merged_state = merge_state(app_state, user_state, session_state)
-=======
-      merged_state = _merge_state(
+      merged_state = merge_state(
           storage_app_state.state, storage_user_state.state, session_state
       )
->>>>>>> upstream/main
       session = storage_session.to_session(state=merged_state)
     return session
 
@@ -615,13 +605,8 @@ class DatabaseSessionService(BaseSessionService):
       sessions = []
       for storage_session in results:
         session_state = storage_session.state
-<<<<<<< HEAD
-        merged_state = merge_state(app_state, user_state, session_state)
-
-=======
         user_state = user_states_map.get(storage_session.user_id, {})
-        merged_state = _merge_state(app_state, user_state, session_state)
->>>>>>> upstream/main
+        merged_state = merge_state(app_state, user_state, session_state)
         sessions.append(storage_session.to_session(state=merged_state))
       return ListSessionsResponse(sessions=sessions)
 
@@ -670,27 +655,6 @@ class DatabaseSessionService(BaseSessionService):
       )
 
       # Extract state delta
-<<<<<<< HEAD
-      app_state_delta = {}
-      user_state_delta = {}
-      session_state_delta = {}
-      if event.actions:
-        if event.actions.state_delta:
-          app_state_delta, user_state_delta, session_state_delta = (
-              extract_state_delta(event.actions.state_delta)
-          )
-
-      # Merge state and update storage
-      if app_state_delta:
-        app_state.update(app_state_delta)
-        storage_app_state.state = app_state
-      if user_state_delta:
-        user_state.update(user_state_delta)
-        storage_user_state.state = user_state
-      if session_state_delta:
-        session_state.update(session_state_delta)
-        storage_session.state = session_state
-=======
       if event.actions and event.actions.state_delta:
         state_deltas = _session_util.extract_state_delta(
             event.actions.state_delta
@@ -705,7 +669,6 @@ class DatabaseSessionService(BaseSessionService):
           storage_user_state.state = storage_user_state.state | user_state_delta
         if session_state_delta:
           storage_session.state = storage_session.state | session_state_delta
->>>>>>> upstream/main
 
       sql_session.add(StorageEvent.from_event(session, event))
 
@@ -718,16 +681,3 @@ class DatabaseSessionService(BaseSessionService):
     # Also update the in-memory session
     await super().append_event(session=session, event=event)
     return event
-<<<<<<< HEAD
-=======
-
-
-def _merge_state(app_state, user_state, session_state):
-  # Merge states for response
-  merged_state = copy.deepcopy(session_state)
-  for key in app_state.keys():
-    merged_state[State.APP_PREFIX + key] = app_state[key]
-  for key in user_state.keys():
-    merged_state[State.USER_PREFIX + key] = user_state[key]
-  return merged_state
->>>>>>> upstream/main
