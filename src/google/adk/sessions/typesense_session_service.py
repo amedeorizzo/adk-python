@@ -30,7 +30,7 @@ from . import _session_util
 from ..events.event import Event
 from ..events.event_actions import EventActions
 from ._session_util import extract_state_delta
-from ._session_util import merge_state
+from ._session_util import _merge_state as merge_state
 from .base_session_service import BaseSessionService
 from .base_session_service import GetSessionConfig
 from .base_session_service import ListSessionsResponse
