@@ -277,9 +277,10 @@ class TypesenseSessionService(BaseSessionService):
     user_state = self._get_user_state(app_name, user_id)
 
     # Extract state deltas
-    app_state_delta, user_state_delta, session_state = extract_state_delta(
-        state if state else {}
-    )
+    deltas = extract_state_delta(state if state else {})
+    app_state_delta = deltas["app"]
+    user_state_delta = deltas["user"]
+    session_state = deltas["session"]
 
     # Apply state deltas
     app_state.update(app_state_delta)
@@ -516,9 +517,10 @@ class TypesenseSessionService(BaseSessionService):
     user_state_delta = {}
     session_state_delta = {}
     if event.actions and event.actions.state_delta:
-      app_state_delta, user_state_delta, session_state_delta = (
-          extract_state_delta(event.actions.state_delta)
-      )
+      deltas = extract_state_delta(event.actions.state_delta)
+      app_state_delta = deltas["app"]
+      user_state_delta = deltas["user"]
+      session_state_delta = deltas["session"]
 
     # Merge state and update storage
     if app_state_delta:
