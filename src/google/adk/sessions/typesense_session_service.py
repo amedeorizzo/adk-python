@@ -312,7 +312,13 @@ class TypesenseSessionService(BaseSessionService):
         "update_time": now_micro,
     }
 
-    self.client.collections["sessions"].documents.create(session_doc)
+    try:
+      self.client.collections["sessions"].documents.create(session_doc)
+    except typesense.exceptions.ObjectAlreadyExists:
+      # Session already exists, update it instead
+      logger.info(f"Session {composite_key} already exists, updating instead")
+      session_doc["update_time"] = now_micro
+      self.client.collections["sessions"].documents[composite_key].update(session_doc)
 
     # Merge states for response
     merged_state = merge_state(app_state, user_state, session_state)
