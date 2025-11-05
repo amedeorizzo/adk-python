@@ -60,6 +60,7 @@ from .sessions.in_memory_session_service import InMemorySessionService
 from .sessions.session import Session
 from .telemetry.tracing import tracer
 from .tools.base_toolset import BaseToolset
+from .utils._debug_output import print_event
 from .utils.context_utils import Aclosing
 
 logger = logging.getLogger('google_adk.' + __name__)
@@ -155,6 +156,7 @@ class Runner:
         self._agent_origin_app_name,
         self._agent_origin_dir,
     ) = self._infer_agent_origin(self.agent)
+    self._app_name_alignment_hint: Optional[str] = None
     self._enforce_app_name_alignment()
 
   def _validate_runner_params(
@@ -230,35 +232,47 @@ class Runner:
     module_path = Path(module_file).resolve()
     project_root = Path.cwd()
     try:
-      module_path.relative_to(project_root)
+      relative_path = module_path.relative_to(project_root)
     except ValueError:
       return None, module_path.parent
-
-    current = module_path.parent
-    while current != project_root and current.parent != current:
-      parent = current.parent
-      if parent.name == 'agents':
-        return current.name, current
-      current = parent
-
-    return None, module_path.parent
+    origin_dir = module_path.parent
+    if 'agents' not in relative_path.parts:
+      return None, origin_dir
+    origin_name = origin_dir.name
+    if origin_name.startswith('.'):
+      return None, origin_dir
+    return origin_name, origin_dir
 
   def _enforce_app_name_alignment(self) -> None:
     origin_name = self._agent_origin_app_name
     origin_dir = self._agent_origin_dir
     if not origin_name or origin_name.startswith('__'):
+      self._app_name_alignment_hint = None
       return
     if origin_name == self.app_name:
+      self._app_name_alignment_hint = None
       return
     origin_location = str(origin_dir) if origin_dir else origin_name
-    message = (
-        'App name mismatch detected. The runner is configured with '
-        f'app name "{self.app_name}", but the root agent was loaded from '
-        f'"{origin_location}", which implies app name "{origin_name}". '
-        'Rename the App or its directory so the names match before running '
-        'the agent.'
+    mismatch_details = (
+        'The runner is configured with app name '
+        f'"{self.app_name}", but the root agent was loaded from '
+        f'"{origin_location}", which implies app name "{origin_name}".'
     )
-    raise ValueError(message)
+    resolution = (
+        'Ensure the runner app_name matches that directory or pass app_name '
+        'explicitly when constructing the runner.'
+    )
+    self._app_name_alignment_hint = f'{mismatch_details} {resolution}'
+    logger.warning('App name mismatch detected. %s', mismatch_details)
+
+  def _format_session_not_found_message(self, session_id: str) -> str:
+    message = f'Session not found: {session_id}'
+    if not self._app_name_alignment_hint:
+      return message
+    return (
+        f'{message}. {self._app_name_alignment_hint} '
+        'The mismatch prevents the runner from locating the session.'
+    )
 
   def run(
       self,
@@ -362,7 +376,8 @@ class Runner:
             app_name=self.app_name, user_id=user_id, session_id=session_id
         )
         if not session:
-          raise ValueError(f'Session not found: {session_id}')
+          message = self._format_session_not_found_message(session_id)
+          raise ValueError(message)
         if not invocation_id and not new_message:
           raise ValueError('Both invocation_id and new_message are None.')
 
@@ -863,7 +878,7 @@ class Runner:
       message)
     """
     # If the last event is a function response, should send this response to
-    # the agent that returned the corressponding function call regardless the
+    # the agent that returned the corresponding function call regardless the
     # type of the agent. e.g. a remote a2a agent may surface a credential
     # request as a special long running function tool call.
     event = find_matching_function_call(session.events)
@@ -916,6 +931,107 @@ class Runner:
         return False
       agent = agent.parent_agent
     return True
+
+  async def run_debug(
+      self,
+      user_messages: str | list[str],
+      *,
+      user_id: str = 'debug_user_id',
+      session_id: str = 'debug_session_id',
+      run_config: RunConfig | None = None,
+      quiet: bool = False,
+      verbose: bool = False,
+  ) -> list[Event]:
+    """Debug helper for quick agent experimentation and testing.
+
+    This convenience method is designed for developers getting started with ADK
+    who want to quickly test agents without dealing with session management,
+    content formatting, or event streaming. It automatically handles common
+    boilerplate while hiding complexity.
+
+    IMPORTANT: This is for debugging and experimentation only. For production
+    use, please use the standard run_async() method which provides full control
+    over session management, event streaming, and error handling.
+
+    Args:
+        user_messages: Message(s) to send to the agent. Can be:
+            - Single string: "What is 2+2?"
+            - List of strings: ["Hello!", "What's my name?"]
+        user_id: User identifier. Defaults to "debug_user_id".
+        session_id: Session identifier for conversation persistence.
+            Defaults to "debug_session_id". Reuse the same ID to continue a conversation.
+        run_config: Optional configuration for the agent execution.
+        quiet: If True, suppresses console output. Defaults to False (output shown).
+        verbose: If True, shows detailed tool calls and responses. Defaults to False
+            for cleaner output showing only final agent responses.
+
+    Returns:
+        list[Event]: All events from all messages.
+
+    Raises:
+        ValueError: If session creation/retrieval fails.
+
+    Examples:
+        Quick debugging:
+        >>> runner = InMemoryRunner(agent=my_agent)
+        >>> await runner.run_debug("What is 2+2?")
+
+        Multiple queries in conversation:
+        >>> await runner.run_debug(["Hello!", "What's my name?"])
+
+        Continue a debug session:
+        >>> await runner.run_debug("What did we discuss?")  # Continues default session
+
+        Separate debug sessions:
+        >>> await runner.run_debug("Hi", user_id="alice", session_id="debug1")
+        >>> await runner.run_debug("Hi", user_id="bob", session_id="debug2")
+
+        Capture events for inspection:
+        >>> events = await runner.run_debug("Analyze this")
+        >>> for event in events:
+        ...     inspect_event(event)
+
+    Note:
+        For production applications requiring:
+        - Custom session/memory services (Spanner, Cloud SQL, etc.)
+        - Fine-grained event processing and streaming
+        - Error recovery and resumability
+        - Performance optimization
+        Please use run_async() with proper configuration.
+    """
+    session = await self.session_service.get_session(
+        app_name=self.app_name, user_id=user_id, session_id=session_id
+    )
+    if not session:
+      session = await self.session_service.create_session(
+          app_name=self.app_name, user_id=user_id, session_id=session_id
+      )
+      if not quiet:
+        print(f'\n ### Created new session: {session_id}')
+    elif not quiet:
+      print(f'\n ### Continue session: {session_id}')
+
+    collected_events: list[Event] = []
+
+    if isinstance(user_messages, str):
+      user_messages = [user_messages]
+
+    for message in user_messages:
+      if not quiet:
+        print(f'\nUser > {message}')
+
+      async for event in self.run_async(
+          user_id=user_id,
+          session_id=session.id,
+          new_message=types.UserContent(parts=[types.Part(text=message)]),
+          run_config=run_config,
+      ):
+        if not quiet:
+          print_event(event, verbose=verbose)
+
+        collected_events.append(event)
+
+    return collected_events
 
   async def _setup_context_for_new_invocation(
       self,

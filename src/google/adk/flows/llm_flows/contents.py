@@ -594,7 +594,12 @@ def _is_event_belongs_to_branch(
   """
   if not invocation_branch or not event.branch:
     return True
-  return invocation_branch.startswith(event.branch)
+  # We use dot to delimit branch nodes. To avoid simple prefix match
+  # (e.g. agent_0 unexpectedly matching agent_00), require either perfect branch
+  # match, or match prefix with an additional explicit '.'
+  return invocation_branch == event.branch or invocation_branch.startswith(
+      f'{event.branch}.'
+  )
 
 
 def _is_function_call_event(event: Event, function_name: str) -> bool:
@@ -639,7 +644,7 @@ def _is_live_model_audio_event(event: Event) -> bool:
       Part(
         inline_data=Blob(
           data=b'\x01\x00\x00...',
-          mime_type='audio/pcm'
+          mime_type='audio/pcm;rate=24000'
         )
       ),
     ],
@@ -653,9 +658,27 @@ def _is_live_model_audio_event(event: Event) -> bool:
     return False
   # If it's audio data, then one event only has one part of audio.
   for part in event.content.parts:
-    if part.inline_data and part.inline_data.mime_type == 'audio/pcm':
+    if (
+        part.inline_data
+        and part.inline_data.mime_type
+        and part.inline_data.mime_type.startswith('audio/')
+    ):
       return True
-    if part.file_data and part.file_data.mime_type == 'audio/pcm':
+    if (
+        part.file_data
+        and part.file_data.mime_type
+        and part.file_data.mime_type.startswith('audio/')
+    ):
+      return True
+  return False
+
+
+def _content_contains_function_response(content: types.Content) -> bool:
+  """Checks whether the content includes any function response parts."""
+  if not content.parts:
+    return False
+  for part in content.parts:
+    if part.function_response:
       return True
   return False
 
@@ -687,13 +710,14 @@ async def _add_instructions_to_user_content(
 
   if llm_request.contents:
     for i in range(len(llm_request.contents) - 1, -1, -1):
-      if llm_request.contents[i].role != 'user':
+      content = llm_request.contents[i]
+      if content.role != 'user':
         insert_index = i + 1
         break
-      elif i == 0:
-        # All content from start is user content
-        insert_index = 0
+      if _content_contains_function_response(content):
+        insert_index = i + 1
         break
+      insert_index = i
   else:
     # No contents remaining, just append at the end
     insert_index = 0

@@ -53,7 +53,9 @@ from typing_extensions import override
 from tzlocal import get_localzone
 
 from . import _session_util
+from ..errors.already_exists_error import AlreadyExistsError
 from ..events.event import Event
+from ..events.event_actions import EventActions
 from ._session_util import extract_state_delta
 from ._session_util import merge_state
 from .base_session_service import BaseSessionService
@@ -126,14 +128,14 @@ class DynamicPickleType(TypeDecorator):
   def process_bind_param(self, value, dialect):
     """Ensures the pickled value is a bytes object before passing it to the database dialect."""
     if value is not None:
-      if dialect.name == "spanner+spanner":
+      if dialect.name in ("spanner+spanner", "mysql"):
         return pickle.dumps(value)
     return value
 
   def process_result_value(self, value, dialect):
     """Ensures the raw bytes from the database are unpickled back into a Python object."""
     if value is not None:
-      if dialect.name == "spanner+spanner":
+      if dialect.name in ("spanner+spanner", "mysql"):
         return pickle.loads(value)
     return value
 
@@ -343,7 +345,9 @@ class StorageEvent(Base):
         invocation_id=self.invocation_id,
         author=self.author,
         branch=self.branch,
-        actions=self.actions,
+        # This is needed as previous ADK version pickled actions might not have
+        # value defined in the current version of the EventActions model.
+        actions=EventActions().model_copy(update=self.actions.model_dump()),
         timestamp=self.timestamp.timestamp(),
         long_running_tool_ids=self.long_running_tool_ids,
         partial=self.partial,
@@ -467,6 +471,12 @@ class DatabaseSessionService(BaseSessionService):
     # 5. Return the session
 
     with self.database_session_factory() as sql_session:
+      if session_id and sql_session.get(
+          StorageSession, (app_name, user_id, session_id)
+      ):
+        raise AlreadyExistsError(
+            f"Session with id {session_id} already exists."
+        )
       # Fetch app and user states from storage
       storage_app_state = sql_session.get(StorageAppState, (app_name))
       if not storage_app_state:

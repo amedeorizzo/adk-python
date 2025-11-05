@@ -80,7 +80,7 @@ class McpTool(BaseAuthenticatedTool):
           Callable[[ReadonlyContext], Dict[str, str]]
       ] = None,
   ):
-    """Initializes an MCPTool.
+    """Initializes an McpTool.
 
     This tool wraps an MCP Tool interface and uses a session manager to
     communicate with the MCP server.
@@ -119,10 +119,12 @@ class McpTool(BaseAuthenticatedTool):
     Returns:
         FunctionDeclaration: The Gemini function declaration for the tool.
     """
-    schema_dict = self._mcp_tool.inputSchema
-    parameters = _to_gemini_schema(schema_dict)
+    input_schema = self._mcp_tool.inputSchema
+    parameters = _to_gemini_schema(input_schema)
     function_decl = FunctionDeclaration(
-        name=self.name, description=self.description, parameters=parameters
+        name=self.name,
+        description=self.description,
+        parameters=parameters,
     )
     return function_decl
 
@@ -186,7 +188,7 @@ class McpTool(BaseAuthenticatedTool):
   @override
   async def _run_async_impl(
       self, *, args, tool_context: ToolContext, credential: AuthCredential
-  ):
+  ) -> Dict[str, Any]:
     """Runs the tool asynchronously.
 
     Args:
@@ -217,7 +219,7 @@ class McpTool(BaseAuthenticatedTool):
     )
 
     response = await session.call_tool(self._mcp_tool.name, arguments=args)
-    return response
+    return response.model_dump(exclude_none=True, mode="json")
 
   async def _get_headers(
       self, tool_context: ToolContext, credential: AuthCredential
@@ -282,7 +284,7 @@ class McpTool(BaseAuthenticatedTool):
             != APIKeyIn.header
         ):
           error_msg = (
-              "MCPTool only supports header-based API key authentication."
+              "McpTool only supports header-based API key authentication."
               " Configured location:"
               f" {self._credentials_manager._auth_config.auth_scheme.in_}"
           )
