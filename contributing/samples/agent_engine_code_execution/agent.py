@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@ def base_system_instruction():
   **Statefulness:** All code snippets are executed and the variables stays in the environment. You NEVER need to re-initialize variables. You NEVER need to reload files. You NEVER need to re-import libraries.
 
   **Output Visibility:** Always print the output of code execution to visualize results, especially for data exploration and analysis. For example:
-    - To look a the shape of a pandas.DataFrame do:
+    - To look at the shape of a pandas.DataFrame do:
       ```tool_code
       print(df.shape)
       ```
@@ -85,11 +85,10 @@ When plotting trends, you should make sure to sort and order the data by the x-a
 
 """,
     code_executor=AgentEngineSandboxCodeExecutor(
-        # Replace with your sandbox resource name if you already have one.
-        sandbox_resource_name="SANDBOX_RESOURCE_NAME",
+        # Replace with your sandbox resource name if you already have one. Only use it for testing or prototyping purposes, because this will use the same sandbox for all requests.
         # "projects/vertex-agent-loadtest/locations/us-central1/reasoningEngines/6842889780301135872/sandboxEnvironments/6545148628569161728",
-        # Replace with agent engine resource name used for creating sandbox if
-        # sandbox_resource_name is not set.
+        sandbox_resource_name=None,
+        # Replace with agent engine resource name used for creating sandbox environment.
         agent_engine_resource_name="AGENT_ENGINE_RESOURCE_NAME",
     ),
 )

@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock
 
 from google.adk.agents.llm_agent import Agent
 from google.adk.events.event import Event
+from google.adk.flows.llm_flows.base_llm_flow import _handle_after_model_callback
 from google.adk.flows.llm_flows.base_llm_flow import BaseLlmFlow
 from google.adk.models.google_llm import Gemini
 from google.adk.models.llm_request import LlmRequest
@@ -285,7 +286,7 @@ async def test_handle_after_model_callback_grounding_with_no_callbacks(
   )
   flow = BaseLlmFlowForTesting()
 
-  result = await flow._handle_after_model_callback(
+  result = await _handle_after_model_callback(
       invocation_context, llm_response, event
   )
 
@@ -342,7 +343,7 @@ async def test_handle_after_model_callback_grounding_with_callback_override(
   )
   flow = BaseLlmFlowForTesting()
 
-  result = await flow._handle_after_model_callback(
+  result = await _handle_after_model_callback(
       invocation_context, llm_response, event
   )
 
@@ -404,7 +405,7 @@ async def test_handle_after_model_callback_grounding_with_plugin_override(
   )
   flow = BaseLlmFlowForTesting()
 
-  result = await flow._handle_after_model_callback(
+  result = await _handle_after_model_callback(
       invocation_context, llm_response, event
   )
 
@@ -413,3 +414,76 @@ async def test_handle_after_model_callback_grounding_with_plugin_override(
 
   assert result == plugin_response
   plugin.after_model_callback.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_handle_after_model_callback_caches_canonical_tools():
+  """Test that canonical_tools is only called once per invocation_context."""
+  canonical_tools_call_count = 0
+
+  async def mock_canonical_tools(self, readonly_context=None):
+    nonlocal canonical_tools_call_count
+    canonical_tools_call_count += 1
+    from google.adk.tools.base_tool import BaseTool
+
+    class MockGoogleSearchTool(BaseTool):
+
+      def __init__(self):
+        super().__init__(name='google_search_agent', description='Mock search')
+
+      async def call(self, **kwargs):
+        return 'mock result'
+
+    return [MockGoogleSearchTool()]
+
+  agent = Agent(name='test_agent', tools=[google_search, dummy_tool])
+
+  with mock.patch.object(
+      type(agent), 'canonical_tools', new=mock_canonical_tools
+  ):
+    invocation_context = await testing_utils.create_invocation_context(
+        agent=agent
+    )
+
+    assert invocation_context.canonical_tools_cache is None
+
+    invocation_context.session.state['temp:_adk_grounding_metadata'] = {
+        'foo': 'bar'
+    }
+
+    llm_response = LlmResponse(
+        content=types.Content(parts=[types.Part.from_text(text='response')])
+    )
+    event = Event(
+        id=Event.new_id(),
+        invocation_id=invocation_context.invocation_id,
+        author=agent.name,
+    )
+    flow = BaseLlmFlowForTesting()
+
+    # Call _handle_after_model_callback multiple times with the same context
+    result1 = await _handle_after_model_callback(
+        invocation_context, llm_response, event
+    )
+    result2 = await _handle_after_model_callback(
+        invocation_context, llm_response, event
+    )
+    result3 = await _handle_after_model_callback(
+        invocation_context, llm_response, event
+    )
+
+    assert canonical_tools_call_count == 1, (
+        'canonical_tools should be called once, but was called '
+        f'{canonical_tools_call_count} times'
+    )
+
+    assert invocation_context.canonical_tools_cache is not None
+    assert len(invocation_context.canonical_tools_cache) == 1
+    assert (
+        invocation_context.canonical_tools_cache[0].name
+        == 'google_search_agent'
+    )
+
+    assert result1.grounding_metadata == {'foo': 'bar'}
+    assert result2.grounding_metadata == {'foo': 'bar'}
+    assert result3.grounding_metadata == {'foo': 'bar'}

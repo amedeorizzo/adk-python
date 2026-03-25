@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ from pydantic import Field
 
 from ..auth.auth_tool import AuthConfig
 from ..tools.tool_confirmation import ToolConfirmation
+from .ui_widget import UiWidget
 
 
 class EventCompaction(BaseModel):
@@ -100,10 +101,14 @@ class EventActions(BaseModel):
   end_of_agent: Optional[bool] = None
   """If true, the current agent has finished its current run. Note that there
   can be multiple events with end_of_agent=True for the same agent within one
-  invocation when there is a loop."""
+  invocation when there is a loop. This should only be set by ADK workflow."""
 
   agent_state: Optional[dict[str, Any]] = None
-  """The agent state at the current event."""
+  """The agent state at the current event, used for checkpoint and resume. This
+  should only be set by ADK workflow."""
 
   rewind_before_invocation_id: Optional[str] = None
   """The invocation id to rewind to. This is only set for rewind event."""
+
+  render_ui_widgets: Optional[list[UiWidget]] = None
+  """List of UI widgets to be rendered by the UI."""

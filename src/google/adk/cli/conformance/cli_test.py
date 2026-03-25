@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,13 +25,13 @@ import click
 from google.genai import types
 
 from ..adk_web_server import RunAgentRequest
+from ._generate_markdown_utils import generate_markdown_report
 from ._generated_file_utils import load_recorded_session
 from ._generated_file_utils import load_test_case
 from ._replay_validators import compare_events
 from ._replay_validators import compare_session
 from .adk_web_server_client import AdkWebServerClient
 from .test_case import TestCase
-from .test_case import TestSpec
 
 
 @dataclass
@@ -42,6 +42,7 @@ class _TestResult:
   name: str
   success: bool
   error_message: Optional[str] = None
+  description: Optional[str] = None
 
 
 @dataclass
@@ -62,7 +63,7 @@ class _ConformanceTestSummary:
 
 
 class ConformanceTestRunner:
-  """Runs conformance tests in replay mode."""
+  """Runs conformance tests."""
 
   def __init__(
       self,
@@ -117,12 +118,35 @@ class ConformanceTestRunner:
       self, session_id: str, test_case: TestCase
   ) -> None:
     """Run all user messages for a test case."""
+    function_call_name_to_id_map = {}
     for user_message_index, user_message in enumerate(
         test_case.test_spec.user_messages
     ):
       # Create content from UserMessage object
       if user_message.content is not None:
         content = user_message.content
+
+        # If the user provides a function response, it means this is for
+        # long-running tool. Replace the function call ID with the actual
+        # function call ID. This is needed because the function call ID is not
+        # known when writing the test case.
+        if (
+            user_message.content.parts
+            and user_message.content.parts[0].function_response
+            and user_message.content.parts[0].function_response.name
+        ):
+          if (
+              user_message.content.parts[0].function_response.name
+              not in function_call_name_to_id_map
+          ):
+            raise ValueError(
+                "Function response for"
+                f" {user_message.content.parts[0].function_response.name} does"
+                " not match any pending function call."
+            )
+          content.parts[0].function_response.id = function_call_name_to_id_map[
+              user_message.content.parts[0].function_response.name
+          ]
       elif user_message.text is not None:
         content = types.UserContent(parts=[types.Part(text=user_message.text)])
       else:
@@ -141,13 +165,18 @@ class ConformanceTestRunner:
       )
 
       # Run the agent but don't collect events here
-      async for _ in self.client.run_agent(
+      async for event in self.client.run_agent(
           request,
           mode="replay",
           test_case_dir=str(test_case.dir),
           user_message_index=user_message_index,
       ):
-        pass
+        if event.content and event.content.parts:
+          for part in event.content.parts:
+            if part.function_call:
+              function_call_name_to_id_map[part.function_call.name] = (
+                  part.function_call.id
+              )
 
   async def _validate_test_results(
       self, session_id: str, test_case: TestCase
@@ -165,6 +194,7 @@ class ConformanceTestRunner:
           name=test_case.name,
           success=False,
           error_message="No final session available for comparison",
+          description=test_case.test_spec.description,
       )
 
     # Load recorded session data for comparison
@@ -175,6 +205,7 @@ class ConformanceTestRunner:
           name=test_case.name,
           success=False,
           error_message="No recorded session found for replay comparison",
+          description=test_case.test_spec.description,
       )
 
     # Compare events and session
@@ -196,6 +227,7 @@ class ConformanceTestRunner:
         name=test_case.name,
         success=success,
         error_message="\n\n".join(error_messages) if error_messages else None,
+        description=test_case.test_spec.description,
     )
 
   async def _run_test_case_replay(self, test_case: TestCase) -> _TestResult:
@@ -217,6 +249,7 @@ class ConformanceTestRunner:
             name=test_case.name,
             success=False,
             error_message=f"Replay verification failed: {e}",
+            description=test_case.test_spec.description,
         )
 
       # Validate results and return test result
@@ -237,6 +270,7 @@ class ConformanceTestRunner:
           name=test_case.name,
           success=False,
           error_message=f"Test setup failed: {e}",
+          description=test_case.test_spec.description,
       )
 
   async def run_all_tests(self) -> _ConformanceTestSummary:
@@ -267,6 +301,7 @@ Found {len(test_cases)} test cases to run in {self.mode} mode
             name=test_case.name,
             success=False,
             error_message="Live mode not yet implemented",
+            description=test_case.test_spec.description,
         )
       results.append(result)
       _print_test_case_result(result)
@@ -283,6 +318,8 @@ Found {len(test_cases)} test cases to run in {self.mode} mode
 async def run_conformance_test(
     test_paths: list[Path],
     mode: str = "replay",
+    generate_report: bool = False,
+    report_dir: Optional[str] = None,
 ) -> None:
   """Run conformance tests."""
   _print_test_header(mode)
@@ -290,6 +327,10 @@ async def run_conformance_test(
   async with AdkWebServerClient() as client:
     runner = ConformanceTestRunner(test_paths, client, mode)
     summary = await runner.run_all_tests()
+
+    if generate_report:
+      version_data = await client.get_version_data()
+      generate_markdown_report(version_data, summary, report_dir)
 
   _print_test_summary(summary)
 

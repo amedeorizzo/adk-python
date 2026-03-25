@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,7 +30,6 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import SpanProcessor
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-from ..utils.feature_decorator import experimental
 from .setup import OTelHooks
 
 if TYPE_CHECKING:
@@ -42,7 +41,6 @@ _GCP_LOG_NAME_ENV_VARIABLE_NAME = 'GOOGLE_CLOUD_DEFAULT_LOG_NAME'
 _DEFAULT_LOG_NAME = 'adk-otel'
 
 
-@experimental
 def get_gcp_exporters(
     enable_cloud_tracing: bool = False,
     enable_cloud_metrics: bool = False,
@@ -53,7 +51,7 @@ def get_gcp_exporters(
 
   Args:
     enable_tracing: whether to enable tracing to Cloud Trace.
-    enable_metrics: whether to enable raporting metrics to Cloud Monitoring.
+    enable_metrics: whether to enable reporting metrics to Cloud Monitoring.
     enable_logging: whether to enable sending logs to Cloud Logging.
     google_auth: optional custom credentials and project_id. google.auth.default() used when this is omitted.
   """

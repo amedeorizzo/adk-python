@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import inspect
 import logging
 from pathlib import Path
 import queue
+import sys
 from typing import Any
 from typing import AsyncGenerator
 from typing import Callable
@@ -31,14 +32,12 @@ from google.adk.apps.compaction import _run_compaction_for_sliding_window
 from google.adk.artifacts import artifact_util
 from google.genai import types
 
-from .agents.active_streaming_tool import ActiveStreamingTool
 from .agents.base_agent import BaseAgent
 from .agents.base_agent import BaseAgentState
 from .agents.context_cache_config import ContextCacheConfig
 from .agents.invocation_context import InvocationContext
 from .agents.invocation_context import new_invocation_context_id
 from .agents.live_request_queue import LiveRequestQueue
-from .agents.llm_agent import LlmAgent
 from .agents.run_config import RunConfig
 from .apps.app import App
 from .apps.app import ResumabilityConfig
@@ -46,9 +45,11 @@ from .artifacts.base_artifact_service import BaseArtifactService
 from .artifacts.in_memory_artifact_service import InMemoryArtifactService
 from .auth.credential_service.base_credential_service import BaseCredentialService
 from .code_executors.built_in_code_executor import BuiltInCodeExecutor
+from .errors.session_not_found_error import SessionNotFoundError
 from .events.event import Event
 from .events.event import EventActions
 from .flows.llm_flows import contents
+from .flows.llm_flows.functions import find_event_by_function_call_id
 from .flows.llm_flows.functions import find_matching_function_call
 from .memory.base_memory_service import BaseMemoryService
 from .memory.in_memory_memory_service import InMemoryMemoryService
@@ -56,6 +57,7 @@ from .platform.thread import create_thread
 from .plugins.base_plugin import BasePlugin
 from .plugins.plugin_manager import PluginManager
 from .sessions.base_session_service import BaseSessionService
+from .sessions.base_session_service import GetSessionConfig
 from .sessions.in_memory_session_service import InMemorySessionService
 from .sessions.session import Session
 from .telemetry.tracing import tracer
@@ -64,6 +66,48 @@ from .utils._debug_output import print_event
 from .utils.context_utils import Aclosing
 
 logger = logging.getLogger('google_adk.' + __name__)
+
+
+def _is_tool_call_or_response(event: Event) -> bool:
+  return bool(event.get_function_calls() or event.get_function_responses())
+
+
+def _get_function_responses_from_content(
+    content: types.Content,
+) -> list[types.FunctionResponse]:
+  if not content:
+    return []
+  return [
+      part.function_response for part in content.parts if part.function_response
+  ]
+
+
+def _is_transcription(event: Event) -> bool:
+  return (
+      event.input_transcription is not None
+      or event.output_transcription is not None
+  )
+
+
+def _has_non_empty_transcription_text(
+    transcription: types.Transcription,
+) -> bool:
+  return bool(
+      transcription and transcription.text and transcription.text.strip()
+  )
+
+
+def _apply_run_config_custom_metadata(
+    event: Event, run_config: RunConfig | None
+) -> None:
+  """Merges run-level custom metadata into the event, if present."""
+  if not run_config or not run_config.custom_metadata:
+    return
+
+  event.custom_metadata = {
+      **run_config.custom_metadata,
+      **(event.custom_metadata or {}),
+  }
 
 
 class Runner:
@@ -115,29 +159,41 @@ class Runner:
       session_service: BaseSessionService,
       memory_service: Optional[BaseMemoryService] = None,
       credential_service: Optional[BaseCredentialService] = None,
+      plugin_close_timeout: float = 5.0,
+      auto_create_session: bool = False,
   ):
     """Initializes the Runner.
 
     Developers should provide either an `app` instance or both `app_name` and
-    `agent`. Providing a mix of `app` and `app_name`/`agent` will result in a
-    `ValueError`. Providing `app` is the recommended way to create a runner.
+    `agent`. When `app` is provided, `app_name` can optionally override the
+    app's name (useful for deployment scenarios like Agent Engine where the
+    resource name differs from the app's identifier). However, `agent` should
+    not be provided when `app` is provided. Providing `app` is the recommended
+    way to create a runner.
 
     Args:
-        app: An optional `App` instance. If provided, `app_name` and `agent`
-          should not be specified.
+        app: An optional `App` instance. If provided, `agent` should not be
+          specified. `app_name` can optionally override `app.name`.
         app_name: The application name of the runner. Required if `app` is not
-          provided.
-        agent: The root agent to run. Required if `app` is not provided.
+          provided. If `app` is provided, this can optionally override `app.name`
+          (e.g., for deployment scenarios where a resource name differs from the
+          app identifier).
+        agent: The root agent to run. Required if `app` is not provided. Should
+          not be provided when `app` is provided.
         plugins: Deprecated. A list of plugins for the runner. Please use the
           `app` argument to provide plugins instead.
         artifact_service: The artifact service for the runner.
         session_service: The session service for the runner.
         memory_service: The memory service for the runner.
         credential_service: The credential service for the runner.
+        plugin_close_timeout: The timeout in seconds for plugin close methods.
+        auto_create_session: Whether to automatically create a session when
+          not found. Defaults to False. If False, a missing session raises
+          ValueError with a helpful message.
 
     Raises:
-        ValueError: If `app` is provided along with `app_name` or `plugins`, or
-          if `app` is not provided but either `app_name` or `agent` is missing.
+        ValueError: If `app` is provided along with `agent` or `plugins`, or if
+          `app` is not provided but either `app_name` or `agent` is missing.
     """
     self.app = app
     (
@@ -151,7 +207,10 @@ class Runner:
     self.session_service = session_service
     self.memory_service = memory_service
     self.credential_service = credential_service
-    self.plugin_manager = PluginManager(plugins=plugins)
+    self.plugin_manager = PluginManager(
+        plugins=plugins, close_timeout=plugin_close_timeout
+    )
+    self.auto_create_session = auto_create_session
     (
         self._agent_origin_app_name,
         self._agent_origin_dir,
@@ -176,7 +235,8 @@ class Runner:
 
     Args:
         app: An optional `App` instance.
-        app_name: The application name of the runner.
+        app_name: The application name of the runner. Can override app.name when
+          app is provided.
         agent: The root agent to run.
         plugins: A list of plugins for the runner.
 
@@ -187,11 +247,14 @@ class Runner:
     Raises:
         ValueError: If parameters are invalid.
     """
+    if plugins is not None:
+      warnings.warn(
+          'The `plugins` argument is deprecated. Please use the `app` argument'
+          ' to provide plugins instead.',
+          DeprecationWarning,
+      )
+
     if app:
-      if app_name:
-        raise ValueError(
-            'When app is provided, app_name should not be provided.'
-        )
       if agent:
         raise ValueError('When app is provided, agent should not be provided.')
       if plugins:
@@ -199,7 +262,9 @@ class Runner:
             'When app is provided, plugins should not be provided and should be'
             ' provided in the app instead.'
         )
-      app_name = app.name
+      # Allow app_name to override app.name (useful for deployment scenarios
+      # like Agent Engine where resource names differ from app identifiers)
+      app_name = app_name or app.name
       agent = app.root_agent
       plugins = app.plugins
       context_cache_config = app.context_cache_config
@@ -212,20 +277,43 @@ class Runner:
       context_cache_config = None
       resumability_config = None
 
-    if plugins:
-      warnings.warn(
-          'The `plugins` argument is deprecated. Please use the `app` argument'
-          ' to provide plugins instead.',
-          DeprecationWarning,
-      )
     return app_name, agent, context_cache_config, resumability_config, plugins
 
   def _infer_agent_origin(
       self, agent: BaseAgent
   ) -> tuple[Optional[str], Optional[Path]]:
+    """Infer the origin app name and directory from an agent's module location.
+
+    Returns:
+      A tuple of (origin_app_name, origin_path):
+        - origin_app_name: The inferred app name (directory name containing the
+          agent), or None if inference is not possible/applicable.
+        - origin_path: The directory path where the agent is defined, or None
+          if the path cannot be determined.
+
+      Both values are None when:
+        - The agent has no associated module
+        - The agent is defined in google.adk.* (ADK internal modules)
+        - The module has no __file__ attribute
+    """
+    # First, check for metadata set by AgentLoader (most reliable source).
+    # AgentLoader sets these attributes when loading agents.
+    origin_app_name = getattr(agent, '_adk_origin_app_name', None)
+    origin_path = getattr(agent, '_adk_origin_path', None)
+    if origin_app_name is not None and origin_path is not None:
+      return origin_app_name, origin_path
+
+    # Fall back to heuristic inference for programmatic usage.
     module = inspect.getmodule(agent.__class__)
     if not module:
       return None, None
+
+    # Skip ADK internal modules. When users instantiate LlmAgent directly
+    # (not subclassed), inspect.getmodule() returns the ADK module. This
+    # could falsely match 'agents' in 'google/adk/agents/' path.
+    if module.__name__.startswith('google.adk.'):
+      return None, None
+
     module_file = getattr(module, '__file__', None)
     if not module_file:
       return None, None
@@ -265,14 +353,87 @@ class Runner:
     self._app_name_alignment_hint = f'{mismatch_details} {resolution}'
     logger.warning('App name mismatch detected. %s', mismatch_details)
 
+  def _resolve_invocation_id(
+      self,
+      session: Session,
+      new_message: Optional[types.Content],
+      invocation_id: Optional[str],
+  ) -> Optional[str]:
+    """Infers invocation_id from new_message if it is a function response."""
+    function_responses = _get_function_responses_from_content(new_message)
+    if not function_responses:
+      return invocation_id
+
+    fc_event = find_event_by_function_call_id(
+        session.events, function_responses[0].id
+    )
+    if not fc_event:
+      raise ValueError(
+          'Function call event not found for function response id:'
+          f' {function_responses[0].id}'
+      )
+
+    if invocation_id and invocation_id != fc_event.invocation_id:
+      logger.warning(
+          'Provided invocation_id %s is ignored because new_message has a '
+          'function response with invocation_id %s.',
+          invocation_id,
+          fc_event.invocation_id,
+      )
+    return fc_event.invocation_id
+
   def _format_session_not_found_message(self, session_id: str) -> str:
     message = f'Session not found: {session_id}'
     if not self._app_name_alignment_hint:
       return message
     return (
         f'{message}. {self._app_name_alignment_hint} '
-        'The mismatch prevents the runner from locating the session.'
+        'The mismatch prevents the runner from locating the session. '
+        'To automatically create a session when missing, set '
+        'auto_create_session=True when constructing the runner.'
     )
+
+  async def _get_or_create_session(
+      self,
+      *,
+      user_id: str,
+      session_id: str,
+      get_session_config: Optional[GetSessionConfig] = None,
+  ) -> Session:
+    """Gets the session or creates it if auto-creation is enabled.
+
+    This helper first attempts to retrieve the session. If not found and
+    auto_create_session is True, it creates a new session with the provided
+    identifiers. Otherwise, it raises a SessionNotFoundError.
+
+    Args:
+      user_id: The user ID of the session.
+      session_id: The session ID of the session.
+      get_session_config: Optional configuration for controlling which events
+        are fetched from session storage.
+
+    Returns:
+      The existing or newly created `Session`.
+
+    Raises:
+      SessionNotFoundError: If the session is not found and
+        auto_create_session is False.
+    """
+    session = await self.session_service.get_session(
+        app_name=self.app_name,
+        user_id=user_id,
+        session_id=session_id,
+        config=get_session_config,
+    )
+    if not session:
+      if self.auto_create_session:
+        session = await self.session_service.create_session(
+            app_name=self.app_name, user_id=user_id, session_id=session_id
+        )
+      else:
+        message = self._format_session_not_found_message(session_id)
+        raise SessionNotFoundError(message)
+    return session
 
   def run(
       self,
@@ -287,6 +448,11 @@ class Runner:
     NOTE:
       This sync interface is only for local testing and convenience purpose.
       Consider using `run_async` for production usage.
+
+    If event compaction is enabled in the App configuration, it will be
+    performed after all agent events for the current invocation have been
+    yielded. The generator will only finish iterating after event
+    compaction is complete.
 
     Args:
       user_id: The user ID of the session.
@@ -346,6 +512,12 @@ class Runner:
   ) -> AsyncGenerator[Event, None]:
     """Main entry method to run the agent in this runner.
 
+    If event compaction is enabled in the App configuration, it will be
+    performed after all agent events for the current invocation have been
+    yielded. The async generator will only finish iterating after event
+    compaction is complete. However, this does not block new `run_async`
+    calls for subsequent user queries, which can be started concurrently.
+
     Args:
       user_id: The user ID of the session.
       session_id: The session ID of the session.
@@ -372,44 +544,62 @@ class Runner:
         invocation_id: Optional[str] = None,
     ) -> AsyncGenerator[Event, None]:
       with tracer.start_as_current_span('invocation'):
-        session = await self.session_service.get_session(
-            app_name=self.app_name, user_id=user_id, session_id=session_id
+        session = await self._get_or_create_session(
+            user_id=user_id,
+            session_id=session_id,
+            get_session_config=run_config.get_session_config,
         )
-        if not session:
-          message = self._format_session_not_found_message(session_id)
-          raise ValueError(message)
-        if not invocation_id and not new_message:
-          raise ValueError('Both invocation_id and new_message are None.')
 
-        if invocation_id:
-          if (
-              not self.resumability_config
-              or not self.resumability_config.is_resumable
-          ):
-            raise ValueError(
-                f'invocation_id: {invocation_id} is provided but the app is not'
-                ' resumable.'
-            )
-          invocation_context = await self._setup_context_for_resumed_invocation(
-              session=session,
-              new_message=new_message,
-              invocation_id=invocation_id,
-              run_config=run_config,
-              state_delta=state_delta,
+        if not invocation_id and not new_message:
+          raise ValueError(
+              'Running an agent requires either a new_message or an '
+              'invocation_id to resume a previous invocation. '
+              f'Session: {session_id}, User: {user_id}'
           )
-          if invocation_context.end_of_agents.get(
-              invocation_context.agent.name
-          ):
-            # Directly return if the current agent in invocation context is
-            # already final.
-            return
-        else:
+
+        is_resumable = (
+            self.resumability_config and self.resumability_config.is_resumable
+        )
+        if not is_resumable and not new_message:
+          raise ValueError(
+              'Running an agent requires a new_message or a resumable app. '
+              f'Session: {session_id}, User: {user_id}'
+          )
+
+        if not is_resumable:
           invocation_context = await self._setup_context_for_new_invocation(
               session=session,
-              new_message=new_message,  # new_message is not None.
+              new_message=new_message,
               run_config=run_config,
               state_delta=state_delta,
           )
+        else:
+          invocation_id = self._resolve_invocation_id(
+              session, new_message, invocation_id
+          )
+          if not invocation_id:
+            invocation_context = await self._setup_context_for_new_invocation(
+                session=session,
+                new_message=new_message,
+                run_config=run_config,
+                state_delta=state_delta,
+            )
+          else:
+            invocation_context = (
+                await self._setup_context_for_resumed_invocation(
+                    session=session,
+                    new_message=new_message,
+                    invocation_id=invocation_id,
+                    run_config=run_config,
+                    state_delta=state_delta,
+                )
+            )
+            if invocation_context.end_of_agents.get(
+                invocation_context.agent.name
+            ):
+              # Directly return if the current agent in invocation context is
+              # already final.
+              return
 
         async def execute(ctx: InvocationContext) -> AsyncGenerator[Event]:
           async with Aclosing(ctx.agent.run_async(ctx)) as agen:
@@ -427,16 +617,15 @@ class Runner:
           async for event in agen:
             yield event
         # Run compaction after all events are yielded from the agent.
-        # (We don't compact in the middle of an invocation, we only compact at the end of an invocation.)
+        # (We don't compact in the middle of an invocation, we only compact at
+        # the end of an invocation.)
         if self.app and self.app.events_compaction_config:
-          logger.info('Running event compactor.')
-          # Run compaction in a separate task to avoid blocking the main thread.
-          # So the users can still finish the event loop from the agent while the
-          # compaction is running.
-          asyncio.create_task(
-              _run_compaction_for_sliding_window(
-                  self.app, session, self.session_service
-              )
+          logger.debug('Running event compactor.')
+          await _run_compaction_for_sliding_window(
+              self.app,
+              session,
+              self.session_service,
+              skip_token_compaction=invocation_context.token_compaction_checked,
           )
 
     async with Aclosing(_run_with_trace(new_message, invocation_id)) as agen:
@@ -449,14 +638,15 @@ class Runner:
       user_id: str,
       session_id: str,
       rewind_before_invocation_id: str,
+      run_config: Optional[RunConfig] = None,
   ) -> None:
     """Rewinds the session to before the specified invocation."""
-    session = await self.session_service.get_session(
-        app_name=self.app_name, user_id=user_id, session_id=session_id
+    run_config = run_config or RunConfig()
+    session = await self._get_or_create_session(
+        user_id=user_id,
+        session_id=session_id,
+        get_session_config=run_config.get_session_config,
     )
-    if not session:
-      raise ValueError(f'Session not found: {session_id}')
-
     rewind_event_index = -1
     for i, event in enumerate(session.events):
       if event.invocation_id == rewind_before_invocation_id:
@@ -583,31 +773,21 @@ class Runner:
 
     return rewind_artifact_delta
 
-  async def _run_compaction_default(self, session: Session):
-    """Runs compaction for other types of compactors.
-
-    This method calls `maybe_compact_events` on the compactor with all
-    events in the session.
-
-    Args:
-      session: The session containing events to compact.
-    """
-    compaction_event = (
-        await self.app.events_compaction_config.compactor.maybe_compact_events(
-            events=session.events
-        )
-    )
-    if compaction_event:
-      await self.session_service.append_event(
-          session=session, event=compaction_event
-      )
-
   def _should_append_event(self, event: Event, is_live_call: bool) -> bool:
     """Checks if an event should be appended to the session."""
     # Don't append audio response from model in live mode to session.
     # The data is appended to artifacts with a reference in file_data in the
     # event.
-    if is_live_call and contents._is_live_model_audio_event(event):
+    # We should append non-partial events only.For example, non-finished(partial)
+    # transcription events should not be appended.
+    # Function call and function response events should be appended.
+    # Other control events should be appended.
+    if is_live_call and contents._is_live_model_audio_event_with_inline_data(
+        event
+    ):
+      # We don't append live model audio events with inline data to avoid
+      # storing large blobs in the session. However, events with file_data
+      # (references to artifacts) should be appended.
       return False
     return True
 
@@ -624,6 +804,7 @@ class Runner:
       invocation_context: The invocation context
       session: The current session
       execute_fn: A callable that returns an AsyncGenerator of Events
+      is_live_call: Whether this is a live call
 
     Yields:
       Events from the execution, including any generated by plugins
@@ -641,6 +822,9 @@ class Runner:
           author='model',
           content=early_exit_result,
       )
+      _apply_run_config_custom_metadata(
+          early_exit_event, invocation_context.run_config
+      )
       if self._should_append_event(early_exit_event, is_live_call):
         await self.session_service.append_event(
             session=session,
@@ -649,18 +833,89 @@ class Runner:
       yield early_exit_event
     else:
       # Step 2: Otherwise continue with normal execution
+      # Note for live/bidi:
+      # the transcription may arrive later than the action(function call
+      # event and thus function response event). In this case, the order of
+      # transcription and function call event will be wrong if we just
+      # append as it arrives. To address this, we should check if there is
+      # transcription going on. If there is transcription going on, we
+      # should hold on appending the function call event until the
+      # transcription is finished. The transcription in progress can be
+      # identified by checking if the transcription event is partial. When
+      # the next transcription event is not partial, it means the previous
+      # transcription is finished. Then if there is any buffered function
+      # call event, we should append them after this finished(non-partial)
+      # transcription event.
+      buffered_events: list[Event] = []
+      is_transcribing: bool = False
+
       async with Aclosing(execute_fn(invocation_context)) as agen:
         async for event in agen:
-          if not event.partial:
-            if self._should_append_event(event, is_live_call):
+          _apply_run_config_custom_metadata(
+              event, invocation_context.run_config
+          )
+          if is_live_call:
+            if event.partial and _is_transcription(event):
+              is_transcribing = True
+            if is_transcribing and _is_tool_call_or_response(event):
+              # only buffer function call and function response event which is
+              # non-partial
+              buffered_events.append(event)
+              continue
+            # Note for live/bidi: for audio response, it's considered as
+            # non-partial event(event.partial=None)
+            # event.partial=False and event.partial=None are considered as
+            # non-partial event; event.partial=True is considered as partial
+            # event.
+            if event.partial is not True:
+              if _is_transcription(event) and (
+                  _has_non_empty_transcription_text(event.input_transcription)
+                  or _has_non_empty_transcription_text(
+                      event.output_transcription
+                  )
+              ):
+                # transcription end signal, append buffered events
+                is_transcribing = False
+                logger.debug(
+                    'Appending transcription finished event: %s', event
+                )
+                if self._should_append_event(event, is_live_call):
+                  await self.session_service.append_event(
+                      session=session, event=event
+                  )
+
+                for buffered_event in buffered_events:
+                  logger.debug('Appending buffered event: %s', buffered_event)
+                  await self.session_service.append_event(
+                      session=session, event=buffered_event
+                  )
+                  yield buffered_event  # yield buffered events to caller
+                buffered_events = []
+              else:
+                # non-transcription event or empty transcription event, for
+                # example, event that stores blob reference, should be appended.
+                if self._should_append_event(event, is_live_call):
+                  logger.debug('Appending non-buffered event: %s', event)
+                  await self.session_service.append_event(
+                      session=session, event=event
+                  )
+          else:
+            if event.partial is not True:
               await self.session_service.append_event(
                   session=session, event=event
               )
+
           # Step 3: Run the on_event callbacks to optionally modify the event.
           modified_event = await plugin_manager.run_on_event_callback(
               invocation_context=invocation_context, event=event
           )
-          yield (modified_event if modified_event else event)
+          if modified_event:
+            _apply_run_config_custom_metadata(
+                modified_event, invocation_context.run_config
+            )
+            yield modified_event
+          else:
+            yield event
 
     # Step 4: Run the after_run callbacks to perform global cleanup tasks or
     # finalizing logs and metrics data.
@@ -731,6 +986,7 @@ class Runner:
           author='user',
           content=new_message,
       )
+    _apply_run_config_custom_metadata(event, invocation_context.run_config)
     # If new_message is a function response, find the matching function call
     # and use its branch as the new event's branch.
     if function_call := invocation_context._find_matching_function_call(event):
@@ -748,6 +1004,36 @@ class Runner:
       session: Optional[Session] = None,
   ) -> AsyncGenerator[Event, None]:
     """Runs the agent in live mode (experimental feature).
+
+    The `run_live` method yields a stream of `Event` objects, but not all
+    yielded events are saved to the session. Here's a breakdown:
+
+    **Events Yielded to Callers:**
+    *   **Live Model Audio Events with Inline Data:** Events containing raw
+        audio `Blob` data(`inline_data`).
+    *   **Live Model Audio Events with File Data:** Both input and output audio
+        data are aggregated into an audio file saved into artifacts. The
+        reference to the file is saved in the event as `file_data`.
+    *   **Usage Metadata:** Events containing token usage.
+    *   **Transcription Events:** Both partial and non-partial transcription
+        events are yielded.
+    *   **Function Call and Response Events:** Always saved.
+    *   **Other Control Events:** Most control events are saved.
+
+    **Events Saved to the Session:**
+    *   **Live Model Audio Events with File Data:** Both input and ouput audio
+        data are aggregated into an audio file saved into artifacts. The
+        reference to the file is saved as event in the `file_data` to session
+        if RunConfig.save_live_model_audio_to_session is True.
+    *   **Usage Metadata Events:** Saved to the session.
+    *   **Non-Partial Transcription Events:** Non-partial transcription events
+        are saved.
+    *   **Function Call and Response Events:** Always saved.
+    *   **Other Control Events:** Most control events are saved.
+
+    **Events Not Saved to the Session:**
+    *   **Live Model Audio Events with Inline Data:** Events containing raw
+        audio `Blob` data are **not** saved to the session.
 
     Args:
         user_id: The user ID for the session. Required if `session` is None.
@@ -779,6 +1065,8 @@ class Runner:
       raise ValueError(
           'Either session or user_id and session_id must be provided.'
       )
+    if live_request_queue is None:
+      raise ValueError('live_request_queue is required for run_live.')
     if session is not None:
       warnings.warn(
           'The `session` parameter is deprecated. Please use `user_id` and'
@@ -787,11 +1075,11 @@ class Runner:
           stacklevel=2,
       )
     if not session:
-      session = await self.session_service.get_session(
-          app_name=self.app_name, user_id=user_id, session_id=session_id
+      session = await self._get_or_create_session(
+          user_id=user_id,
+          session_id=session_id,
+          get_session_config=run_config.get_session_config,
       )
-      if not session:
-        raise ValueError(f'Session not found: {session_id}')
     invocation_context = self._new_invocation_context_for_live(
         session,
         live_request_queue=live_request_queue,
@@ -800,45 +1088,6 @@ class Runner:
 
     root_agent = self.agent
     invocation_context.agent = self._find_agent_to_run(session, root_agent)
-
-    # Pre-processing for live streaming tools
-    # Inspect the tool's parameters to find if it uses LiveRequestQueue
-    invocation_context.active_streaming_tools = {}
-    # TODO(hangfei): switch to use canonical_tools.
-    # for shell agents, there is no tools associated with it so we should skip.
-    if hasattr(invocation_context.agent, 'tools'):
-      import inspect
-
-      for tool in invocation_context.agent.tools:
-        # We use `inspect.signature()` to examine the tool's underlying function (`tool.func`).
-        # This approach is deliberately chosen over `typing.get_type_hints()` for robustness.
-        #
-        # The Problem with `get_type_hints()`:
-        # `get_type_hints()` attempts to resolve forward-referenced (string-based) type
-        # annotations. This resolution can easily fail with a `NameError` (e.g., "Union not found")
-        # if the type isn't available in the scope where `get_type_hints()` is called.
-        # This is a common and brittle issue in framework code that inspects functions
-        # defined in separate user modules.
-        #
-        # Why `inspect.signature()` is Better Here:
-        # `inspect.signature()` does NOT resolve the annotations; it retrieves the raw
-        # annotation object as it was defined on the function. This allows us to
-        # perform a direct and reliable identity check (`param.annotation is LiveRequestQueue`)
-        # without risking a `NameError`.
-        callable_to_inspect = tool.func if hasattr(tool, 'func') else tool
-        # Ensure the target is actually callable before inspecting to avoid errors.
-        if not callable(callable_to_inspect):
-          continue
-        for param in inspect.signature(callable_to_inspect).parameters.values():
-          if param.annotation is LiveRequestQueue:
-            if not invocation_context.active_streaming_tools:
-              invocation_context.active_streaming_tools = {}
-            active_streaming_tool = ActiveStreamingTool(
-                stream=LiveRequestQueue()
-            )
-            invocation_context.active_streaming_tools[tool.__name__] = (
-                active_streaming_tool
-            )
 
     async def execute(ctx: InvocationContext) -> AsyncGenerator[Event]:
       async with Aclosing(ctx.agent.run_live(ctx)) as agen:
@@ -880,7 +1129,7 @@ class Runner:
     # If the last event is a function response, should send this response to
     # the agent that returned the corresponding function call regardless the
     # type of the agent. e.g. a remote a2a agent may surface a credential
-    # request as a special long running function tool call.
+    # request as a special long-running function tool call.
     event = find_matching_function_call(session.events)
     if event and event.author:
       return root_agent.find_agent(event.author)
@@ -924,8 +1173,8 @@ class Runner:
     """
     agent = agent_to_run
     while agent:
-      if not isinstance(agent, LlmAgent):
-        # Only LLM-based Agent can provide agent transfer capability.
+      if not hasattr(agent, 'disallow_transfer_to_parent'):
+        # Only agents with transfer capability can transfer.
         return False
       if agent.disallow_transfer_to_parent:
         return False
@@ -954,16 +1203,16 @@ class Runner:
     over session management, event streaming, and error handling.
 
     Args:
-        user_messages: Message(s) to send to the agent. Can be:
-            - Single string: "What is 2+2?"
-            - List of strings: ["Hello!", "What's my name?"]
+        user_messages: Message(s) to send to the agent. Can be: - Single string:
+          "What is 2+2?" - List of strings: ["Hello!", "What's my name?"]
         user_id: User identifier. Defaults to "debug_user_id".
-        session_id: Session identifier for conversation persistence.
-            Defaults to "debug_session_id". Reuse the same ID to continue a conversation.
+        session_id: Session identifier for conversation persistence. Defaults to
+          "debug_session_id". Reuse the same ID to continue a conversation.
         run_config: Optional configuration for the agent execution.
-        quiet: If True, suppresses console output. Defaults to False (output shown).
-        verbose: If True, shows detailed tool calls and responses. Defaults to False
-            for cleaner output showing only final agent responses.
+        quiet: If True, suppresses console output. Defaults to False (output
+          shown).
+        verbose: If True, shows detailed tool calls and responses. Defaults to
+          False for cleaner output showing only final agent responses.
 
     Returns:
         list[Event]: All events from all messages.
@@ -980,7 +1229,8 @@ class Runner:
         >>> await runner.run_debug(["Hello!", "What's my name?"])
 
         Continue a debug session:
-        >>> await runner.run_debug("What did we discuss?")  # Continues default session
+        >>> await runner.run_debug("What did we discuss?")  # Continues default
+        session
 
         Separate debug sessions:
         >>> await runner.run_debug("Hi", user_id="alice", session_id="debug1")
@@ -999,8 +1249,12 @@ class Runner:
         - Performance optimization
         Please use run_async() with proper configuration.
     """
+    run_config = run_config or RunConfig()
     session = await self.session_service.get_session(
-        app_name=self.app_name, user_id=user_id, session_id=session_id
+        app_name=self.app_name,
+        user_id=user_id,
+        session_id=session_id,
+        config=run_config.get_session_config,
     )
     if not session:
       session = await self.session_service.create_session(
@@ -1044,7 +1298,7 @@ class Runner:
     """Sets up the context for a new invocation.
 
     Args:
-      session: The session to setup the invocation context for.
+      session: The session to set up the invocation context for.
       new_message: The new message to process and append to the session.
       run_config: The run config of the agent.
       state_delta: Optional state changes to apply to the session.
@@ -1083,7 +1337,7 @@ class Runner:
     """Sets up the context for a resumed invocation.
 
     Args:
-      session: The session to setup the invocation context for.
+      session: The session to set up the invocation context for.
       new_message: The new message to process and append to the session.
       invocation_id: The invocation id to resume.
       run_config: The run config of the agent.
@@ -1099,7 +1353,7 @@ class Runner:
     if not session.events:
       raise ValueError(f'Session {session.id} has no events to resume.')
 
-    # Step 1: Maybe retrive a previous user message for the invocation.
+    # Step 1: Maybe retrieve a previous user message for the invocation.
     user_message = new_message or self._find_user_message_for_invocation(
         session.events, invocation_id
     )
@@ -1149,6 +1403,10 @@ class Runner:
         return event.content
     return None
 
+  def _create_invocation_context(self, **kwargs) -> InvocationContext:
+    """Creates an InvocationContext instance."""
+    return InvocationContext(**kwargs)
+
   def _new_invocation_context(
       self,
       session: Session,
@@ -1173,7 +1431,7 @@ class Runner:
     run_config = run_config or RunConfig()
     invocation_id = invocation_id or new_invocation_context_id()
 
-    if run_config.support_cfc and isinstance(self.agent, LlmAgent):
+    if run_config.support_cfc and hasattr(self.agent, 'canonical_model'):
       model_name = self.agent.canonical_model.model
       if not model_name.startswith('gemini-2'):
         raise ValueError(
@@ -1183,13 +1441,16 @@ class Runner:
       if not isinstance(self.agent.code_executor, BuiltInCodeExecutor):
         self.agent.code_executor = BuiltInCodeExecutor()
 
-    return InvocationContext(
+    return self._create_invocation_context(
         artifact_service=self.artifact_service,
         session_service=self.session_service,
         memory_service=self.memory_service,
         credential_service=self.credential_service,
         plugin_manager=self.plugin_manager,
         context_cache_config=self.context_cache_config,
+        events_compaction_config=(
+            self.app.events_compaction_config if self.app else None
+        ),
         invocation_id=invocation_id,
         agent=self.agent,
         session=session,
@@ -1203,29 +1464,21 @@ class Runner:
       self,
       session: Session,
       *,
-      live_request_queue: Optional[LiveRequestQueue] = None,
+      live_request_queue: LiveRequestQueue,
       run_config: Optional[RunConfig] = None,
   ) -> InvocationContext:
     """Creates a new invocation context for live multi-agent."""
     run_config = run_config or RunConfig()
 
-    # For live multi-agent, we need model's text transcription as context for
-    # next agent.
-    if self.agent.sub_agents and live_request_queue:
-      if not run_config.response_modalities:
-        # default
-        run_config.response_modalities = ['AUDIO']
-        if not run_config.output_audio_transcription:
-          run_config.output_audio_transcription = (
-              types.AudioTranscriptionConfig()
-          )
-      elif 'TEXT' not in run_config.response_modalities:
+    # For live multi-agents system, we need model's text transcription as
+    # context for the transferred agent.
+    if self.agent.sub_agents:
+      if 'AUDIO' in run_config.response_modalities:
         if not run_config.output_audio_transcription:
           run_config.output_audio_transcription = (
               types.AudioTranscriptionConfig()
           )
       if not run_config.input_audio_transcription:
-        # need this input transcription for agent transferring in live mode.
         run_config.input_audio_transcription = types.AudioTranscriptionConfig()
     return self._new_invocation_context(
         session,
@@ -1259,19 +1512,23 @@ class Runner:
     )
     if modified_user_message is not None:
       new_message = modified_user_message
+      invocation_context.user_content = new_message
 
     if new_message:
+      deprecated_save_blobs = False
+      if 'save_input_blobs_as_artifacts' in run_config.model_fields_set:
+        deprecated_save_blobs = run_config.save_input_blobs_as_artifacts
       await self._append_new_message_to_session(
           session=session,
           new_message=new_message,
           invocation_context=invocation_context,
-          save_input_blobs_as_artifacts=run_config.save_input_blobs_as_artifacts,
+          save_input_blobs_as_artifacts=deprecated_save_blobs,
           state_delta=state_delta,
       )
 
   def _collect_toolset(self, agent: BaseAgent) -> set[BaseToolset]:
     toolsets = set()
-    if isinstance(agent, LlmAgent):
+    if hasattr(agent, 'tools'):
       for tool_union in agent.tools:
         if isinstance(tool_union, BaseToolset):
           toolsets.add(tool_union)
@@ -1311,9 +1568,22 @@ class Runner:
 
   async def close(self):
     """Closes the runner."""
+    logger.info('Closing runner...')
+    # Close Toolsets
     await self._cleanup_toolsets(self._collect_toolset(self.agent))
 
-  async def __aenter__(self):
+    # Close Plugins
+    if self.plugin_manager:
+      await self.plugin_manager.close()
+
+    logger.info('Runner closed.')
+
+  if sys.version_info < (3, 11):
+    Self = 'Runner'  # pylint: disable=invalid-name
+  else:
+    from typing import Self  # pylint: disable=g-import-not-at-top
+
+  async def __aenter__(self) -> Self:
     """Async context manager entry."""
     return self
 
@@ -1343,6 +1613,7 @@ class InMemoryRunner(Runner):
       app_name: Optional[str] = None,
       plugins: Optional[list[BasePlugin]] = None,
       app: Optional[App] = None,
+      plugin_close_timeout: float = 5.0,
   ):
     """Initializes the InMemoryRunner.
 
@@ -1350,6 +1621,9 @@ class InMemoryRunner(Runner):
         agent: The root agent to run.
         app_name: The application name of the runner. Defaults to
           'InMemoryRunner'.
+        plugins: Optional list of plugins for the runner.
+        app: Optional App instance.
+        plugin_close_timeout: The timeout in seconds for plugin close methods.
     """
     if app is None and app_name is None:
       app_name = 'InMemoryRunner'
@@ -1361,4 +1635,5 @@ class InMemoryRunner(Runner):
         app=app,
         session_service=InMemorySessionService(),
         memory_service=InMemoryMemoryService(),
+        plugin_close_timeout=plugin_close_timeout,
     )

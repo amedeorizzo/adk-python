@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,7 +36,6 @@ class TestBigQueryCredentials:
     to pass them directly without needing to provide client ID/secret.
     """
     # Create a mock auth credentials object
-    # auth_creds = google.auth.credentials.Credentials()
     auth_creds = mock.create_autospec(
         google.auth.credentials.Credentials, instance=True
     )
@@ -45,9 +44,11 @@ class TestBigQueryCredentials:
 
     # Verify that the credentials are properly stored and attributes are extracted
     assert config.credentials == auth_creds
-    assert config.client_id is None
     assert config.client_secret is None
-    assert config.scopes == ["https://www.googleapis.com/auth/bigquery"]
+    assert config.scopes == [
+        "https://www.googleapis.com/auth/bigquery",
+        "https://www.googleapis.com/auth/dataplex.read-write",
+    ]
 
   def test_valid_credentials_object_oauth2_credentials(self):
     """Test that providing valid Credentials object works correctly with
@@ -87,7 +88,10 @@ class TestBigQueryCredentials:
     assert config.credentials is None
     assert config.client_id == "test_client_id"
     assert config.client_secret == "test_client_secret"
-    assert config.scopes == ["https://www.googleapis.com/auth/bigquery"]
+    assert config.scopes == [
+        "https://www.googleapis.com/auth/bigquery",
+        "https://www.googleapis.com/auth/dataplex.read-write",
+    ]
 
   def test_valid_client_id_secret_pair_w_scope(self):
     """Test that providing client ID and secret with explicit scopes works.
@@ -129,7 +133,10 @@ class TestBigQueryCredentials:
     assert config.credentials is None
     assert config.client_id == "test_client_id"
     assert config.client_secret == "test_client_secret"
-    assert config.scopes == ["https://www.googleapis.com/auth/bigquery"]
+    assert config.scopes == [
+        "https://www.googleapis.com/auth/bigquery",
+        "https://www.googleapis.com/auth/dataplex.read-write",
+    ]
 
   def test_missing_client_secret_raises_error(self):
     """Test that missing client secret raises appropriate validation error.
@@ -140,8 +147,8 @@ class TestBigQueryCredentials:
     with pytest.raises(
         ValueError,
         match=(
-            "Must provide either credentials or client_id and client_secret"
-            " pair"
+            "Must provide one of credentials, external_access_token_key, or"
+            " client_id and client_secret pair"
         ),
     ):
       BigQueryCredentialsConfig(client_id="test_client_id")
@@ -151,8 +158,8 @@ class TestBigQueryCredentials:
     with pytest.raises(
         ValueError,
         match=(
-            "Must provide either credentials or client_id and client_secret"
-            " pair"
+            "Must provide one of credentials, external_access_token_key, or"
+            " client_id and client_secret pair"
         ),
     ):
       BigQueryCredentialsConfig(client_secret="test_client_secret")
@@ -166,8 +173,8 @@ class TestBigQueryCredentials:
     with pytest.raises(
         ValueError,
         match=(
-            "Must provide either credentials or client_id and client_secret"
-            " pair"
+            "Must provide one of credentials, external_access_token_key, or"
+            " client_id and client_secret pair"
         ),
     ):
       BigQueryCredentialsConfig()

@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from typing import AsyncGenerator
 from typing import Optional
 
@@ -28,6 +29,9 @@ from ._base_llm_processor import BaseLlmRequestProcessor
 from .functions import remove_client_function_call_id
 from .functions import REQUEST_CONFIRMATION_FUNCTION_CALL_NAME
 from .functions import REQUEST_EUC_FUNCTION_CALL_NAME
+from .functions import REQUEST_INPUT_FUNCTION_CALL_NAME
+
+logger = logging.getLogger('google_adk.' + __name__)
 
 
 class _ContentLlmRequestProcessor(BaseLlmRequestProcessor):
@@ -37,9 +41,16 @@ class _ContentLlmRequestProcessor(BaseLlmRequestProcessor):
   async def run_async(
       self, invocation_context: InvocationContext, llm_request: LlmRequest
   ) -> AsyncGenerator[Event, None]:
-    from ...agents.llm_agent import LlmAgent
+    from ...models.google_llm import Gemini
 
     agent = invocation_context.agent
+    preserve_function_call_ids = False
+    if hasattr(agent, 'canonical_model'):
+      canonical_model = agent.canonical_model
+      preserve_function_call_ids = (
+          isinstance(canonical_model, Gemini)
+          and canonical_model.use_interactions_api
+      )
 
     # Preserve all contents that were added by instruction processor
     # (since llm_request.contents will be completely reassigned below)
@@ -51,6 +62,7 @@ class _ContentLlmRequestProcessor(BaseLlmRequestProcessor):
           invocation_context.branch,
           invocation_context.session.events,
           agent.name,
+          preserve_function_call_ids=preserve_function_call_ids,
       )
     else:
       # Include current turn context only (no conversation history)
@@ -58,6 +70,7 @@ class _ContentLlmRequestProcessor(BaseLlmRequestProcessor):
           invocation_context.branch,
           invocation_context.session.events,
           agent.name,
+          preserve_function_call_ids=preserve_function_call_ids,
       )
 
     # Add instruction-related contents to proper position in conversation
@@ -183,6 +196,12 @@ def _rearrange_events_for_latest_function_response(
           break
 
   if function_call_event_idx == -1:
+    logger.debug(
+        'No function call event found for function responses ids: %s in'
+        ' event list: %s',
+        function_responses_ids,
+        events,
+    )
     raise ValueError(
         'No function call event found for function responses ids:'
         f' {function_responses_ids}'
@@ -210,12 +229,43 @@ def _rearrange_events_for_latest_function_response(
   return result_events
 
 
+def _is_part_invisible(p: types.Part) -> bool:
+  """Returns whether a part is invisible for LLM context.
+
+  A part is invisible if:
+  - It has no meaningful content (text, inline_data, file_data, function_call,
+    function_response, executable_code, or code_execution_result), OR
+  - It is marked as a thought AND does not contain function_call or
+    function_response
+
+  Function calls and responses are never invisible, even if marked as thought,
+  because they represent actions that need to be executed or results that need
+  to be processed.
+
+  Args:
+    p: The part to check.
+  """
+  # Function calls and responses are never invisible, even if marked as thought
+  if p.function_call or p.function_response:
+    return False
+
+  return p.thought or not (
+      p.text
+      or p.inline_data
+      or p.file_data
+      or p.executable_code
+      or p.code_execution_result
+  )
+
+
 def _contains_empty_content(event: Event) -> bool:
   """Check if an event should be skipped due to missing or empty content.
 
-  This can happen to the evnets that only changed session state.
+  This can happen to the events that only changed session state.
   When both content and transcriptions are empty, the event will be considered
-  as empty.
+  as empty. The content is considered empty if none of its parts contain text,
+  inline data, file data, function call, function response, executable code, or
+  code execution result. Parts with only thoughts are also considered empty.
 
   Args:
     event: The event to check.
@@ -230,8 +280,34 @@ def _contains_empty_content(event: Event) -> bool:
       not event.content
       or not event.content.role
       or not event.content.parts
-      or event.content.parts[0].text == ''
+      or all(_is_part_invisible(p) for p in event.content.parts)
   ) and (not event.output_transcription and not event.input_transcription)
+
+
+def _should_include_event_in_context(
+    current_branch: Optional[str], event: Event
+) -> bool:
+  """Determines if an event should be included in the LLM context.
+
+  This filters out events that are considered empty (e.g., no text, function
+  calls, or transcriptions), do not belong to the current agent's branch, or
+  are internal events like authentication or confirmation requests.
+
+  Args:
+    current_branch: The current branch of the agent.
+    event: The event to filter.
+
+  Returns:
+    True if the event should be included in the context, False otherwise.
+  """
+  return not (
+      _contains_empty_content(event)
+      or not _is_event_belongs_to_branch(current_branch, event)
+      or _is_adk_framework_event(event)
+      or _is_auth_event(event)
+      or _is_request_confirmation_event(event)
+      or _is_request_input_event(event)
+  )
 
 
 def _process_compaction_events(events: list[Event]) -> list[Event]:
@@ -246,54 +322,96 @@ def _process_compaction_events(events: list[Event]) -> list[Event]:
   Returns:
     A list of events with compaction applied.
   """
-  # example of compaction events:
-  # [event_1(timestamp=1), event_2(timestamp=2),
-  # compaction_1(event_1, event_2, timestamp=3), event_3(timestamp=4),
-  # compaction_2(event_2, event_3, timestamp=5), event_4(timestamp=6)]
-  # for each compaction event, it only covers the events at most between the
-  # current compaction and the previous compaction. So during copmaction, we
-  # don't have to go across compaction boundaries.
-  # Compaction events are always strictly in order based on event timestamp.
-  events_to_process = []
-  last_compaction_start_time = float('inf')
+  # Example:
+  # [event_1(ts=1), event_2(ts=2), compaction_1(1-2), event_3(ts=4),
+  #  compaction_2(2-4), event_4(ts=6)].
+  #
+  # Overlaps are resolved by keeping only non-subsumed compaction summaries.
+  # A summary event is materialized at its compaction end timestamp, and raw
+  # events inside any kept compaction range are filtered out.
+  compaction_infos: list[tuple[int, float, float]] = []
+  for i, event in enumerate(events):
+    if not (event.actions and event.actions.compaction):
+      continue
+    compaction = event.actions.compaction
+    if (
+        compaction.start_timestamp is None
+        or compaction.end_timestamp is None
+        or compaction.compacted_content is None
+    ):
+      continue
+    compaction_infos.append(
+        (i, compaction.start_timestamp, compaction.end_timestamp)
+    )
 
-  # Iterate in reverse to easily handle overlapping compactions.
-  for event in reversed(events):
+  subsumed_compaction_event_indexes: set[int] = set()
+  for event_index, start_ts, end_ts in compaction_infos:
+    for other_index, other_start, other_end in compaction_infos:
+      if other_index == event_index:
+        continue
+      if other_start <= start_ts and other_end >= end_ts:
+        if (
+            other_start < start_ts
+            or other_end > end_ts
+            or other_index > event_index
+        ):
+          subsumed_compaction_event_indexes.add(event_index)
+          break
+
+  compaction_ranges: list[tuple[float, float]] = []
+  processed_items: list[tuple[float, int, Event]] = []
+
+  for i, event in enumerate(events):
     if event.actions and event.actions.compaction:
+      if i in subsumed_compaction_event_indexes:
+        continue
       compaction = event.actions.compaction
       if (
-          compaction.start_timestamp is not None
-          and compaction.end_timestamp is not None
+          compaction.start_timestamp is None
+          or compaction.end_timestamp is None
+          or compaction.compacted_content is None
       ):
-        # Create a new event for the compacted summary.
-        new_event = Event(
-            timestamp=compaction.end_timestamp,
-            author='model',
-            content=compaction.compacted_content,
-            branch=event.branch,
-            invocation_id=event.invocation_id,
-            actions=event.actions,
-        )
-        # Prepend to maintain chronological order in the final list.
-        events_to_process.insert(0, new_event)
-        # Update the boundary for filtering. Events with timestamps greater than
-        # or equal to this start time have been compacted.
-        last_compaction_start_time = min(
-            last_compaction_start_time, compaction.start_timestamp
-        )
-    elif event.timestamp < last_compaction_start_time:
-      # This event is not a compaction and is before the current compaction
-      # range. Prepend to maintain chronological order.
-      events_to_process.insert(0, event)
-    else:
-      # skip the event
-      pass
+        continue
+      compaction_ranges.append(
+          (compaction.start_timestamp, compaction.end_timestamp)
+      )
+      processed_items.append((
+          compaction.end_timestamp,
+          i,
+          Event(
+              timestamp=compaction.end_timestamp,
+              author='model',
+              content=compaction.compacted_content,
+              branch=event.branch,
+              invocation_id=event.invocation_id,
+              actions=event.actions,
+          ),
+      ))
 
-  return events_to_process
+  def _is_timestamp_compacted(ts: float) -> bool:
+    for start_ts, end_ts in compaction_ranges:
+      if start_ts <= ts <= end_ts:
+        return True
+    return False
+
+  for i, event in enumerate(events):
+    if event.actions and event.actions.compaction:
+      continue
+    if _is_timestamp_compacted(event.timestamp):
+      continue
+    processed_items.append((event.timestamp, i, event))
+
+  # Keep chronological order and a stable tie-breaker for equal timestamps.
+  processed_items.sort(key=lambda item: (item[0], item[1]))
+  return [event for _, _, event in processed_items]
 
 
 def _get_contents(
-    current_branch: Optional[str], events: list[Event], agent_name: str = ''
+    current_branch: Optional[str],
+    events: list[Event],
+    agent_name: str = '',
+    *,
+    preserve_function_call_ids: bool = False,
 ) -> list[types.Content]:
   """Get the contents for the LLM request.
 
@@ -303,6 +421,7 @@ def _get_contents(
     current_branch: The current branch of the agent.
     events: Events to process.
     agent_name: The name of the agent.
+    preserve_function_call_ids: Whether to preserve function call ids.
 
   Returns:
     A list of processed contents.
@@ -331,24 +450,15 @@ def _get_contents(
 
   # Parse the events, leaving the contents and the function calls and
   # responses from the current agent.
-  raw_filtered_events = []
-  has_compaction_events = False
-  for event in rewind_filtered_events:
-    if _contains_empty_content(event):
-      continue
-    if not _is_event_belongs_to_branch(current_branch, event):
-      # Skip events not belong to current branch.
-      continue
-    if _is_auth_event(event):
-      # Skip auth events.
-      continue
-    if _is_request_confirmation_event(event):
-      # Skip request confirmation events.
-      continue
+  raw_filtered_events = [
+      e
+      for e in rewind_filtered_events
+      if _should_include_event_in_context(current_branch, e)
+  ]
 
-    if event.actions and event.actions.compaction:
-      has_compaction_events = True
-    raw_filtered_events.append(event)
+  has_compaction_events = any(
+      e.actions and e.actions.compaction for e in raw_filtered_events
+  )
 
   if has_compaction_events:
     events_to_process = _process_compaction_events(raw_filtered_events)
@@ -411,13 +521,18 @@ def _get_contents(
   for event in result_events:
     content = copy.deepcopy(event.content)
     if content:
-      remove_client_function_call_id(content)
+      if not preserve_function_call_ids:
+        remove_client_function_call_id(content)
       contents.append(content)
   return contents
 
 
 def _get_current_turn_contents(
-    current_branch: Optional[str], events: list[Event], agent_name: str = ''
+    current_branch: Optional[str],
+    events: list[Event],
+    agent_name: str = '',
+    *,
+    preserve_function_call_ids: bool = False,
 ) -> list[types.Content]:
   """Get contents for the current turn only (no conversation history).
 
@@ -433,6 +548,7 @@ def _get_current_turn_contents(
     current_branch: The current branch of the agent.
     events: A list of all session events.
     agent_name: The name of the agent.
+    preserve_function_call_ids: Whether to preserve function call ids.
 
   Returns:
     A list of contents for the current turn only, preserving context needed
@@ -441,10 +557,15 @@ def _get_current_turn_contents(
   # Find the latest event that starts the current turn and process from there
   for i in range(len(events) - 1, -1, -1):
     event = events[i]
-    if not event.content:
-      continue
-    if event.author == 'user' or _is_other_agent_reply(agent_name, event):
-      return _get_contents(current_branch, events[i:], agent_name)
+    if _should_include_event_in_context(current_branch, event) and (
+        event.author == 'user' or _is_other_agent_reply(agent_name, event)
+    ):
+      return _get_contents(
+          current_branch,
+          events[i:],
+          agent_name,
+          preserve_function_call_ids=preserve_function_call_ids,
+      )
 
   return []
 
@@ -481,7 +602,7 @@ def _present_other_agent_message(event: Event) -> Optional[Event]:
     if part.thought:
       # Exclude thoughts from the context.
       continue
-    elif part.text:
+    elif part.text is not None and part.text.strip():
       content.parts.append(
           types.Part(text=f'[{event.author}] said: {part.text}')
       )
@@ -504,11 +625,17 @@ def _present_other_agent_message(event: Event) -> Optional[Event]:
               )
           )
       )
-    # Fallback to the original part for non-text and non-functionCall parts.
-    else:
+    elif (
+        part.inline_data
+        or part.file_data
+        or part.executable_code
+        or part.code_execution_result
+    ):
       content.parts.append(part)
+    else:
+      continue
 
-  # If no meaningful parts were added (only "For context:" remains), return None
+  # Return None when only "For context:" remains.
   if len(content.parts) == 1:
     return None
 
@@ -589,7 +716,7 @@ def _is_event_belongs_to_branch(
 ) -> bool:
   """Check if an event belongs to the current branch.
 
-  This is for event context segration between agents. E.g. agent A shouldn't
+  This is for event context segregation between agents. E.g. agent A shouldn't
   see output of agent B.
   """
   if not invocation_branch or not event.branch:
@@ -624,10 +751,20 @@ def _is_request_confirmation_event(event: Event) -> bool:
   return _is_function_call_event(event, REQUEST_CONFIRMATION_FUNCTION_CALL_NAME)
 
 
-def _is_live_model_audio_event(event: Event) -> bool:
-  """Check if the event is an audio event produced by live/bidi models
+def _is_adk_framework_event(event: Event) -> bool:
+  """Checks if the event is an ADK framework event."""
+  return _is_function_call_event(event, 'adk_framework')
 
-  There are two possible cases:
+
+def _is_request_input_event(event: Event) -> bool:
+  """Checks if the event is a request input event."""
+  return _is_function_call_event(event, REQUEST_INPUT_FUNCTION_CALL_NAME)
+
+
+def _is_live_model_audio_event_with_inline_data(event: Event) -> bool:
+  """Check if the event is a live/bidi audio event with inline data.
+
+  There are two possible cases and we only care about the second case:
   content=Content(
     parts=[
       Part(
@@ -652,22 +789,13 @@ def _is_live_model_audio_event(event: Event) -> bool:
   ) grounding_metadata=None partial=None turn_complete=None finish_reason=None
   error_code=None error_message=None ...
   """
-  if not event.content:
+  if not event.content or not event.content.parts:
     return False
-  if not event.content.parts:
-    return False
-  # If it's audio data, then one event only has one part of audio.
   for part in event.content.parts:
     if (
         part.inline_data
         and part.inline_data.mime_type
         and part.inline_data.mime_type.startswith('audio/')
-    ):
-      return True
-    if (
-        part.file_data
-        and part.file_data.mime_type
-        and part.file_data.mime_type.startswith('audio/')
     ):
       return True
   return False

@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@ class LlmResponse(BaseModel):
   Attributes:
     content: The content of the response.
     grounding_metadata: The grounding metadata of the response.
-    partial: Indicates whether the text content is part of a unfinished text
+    partial: Indicates whether the text content is part of an unfinished text
       stream. Only used for streaming mode and when the content is plain text.
     turn_complete: Indicates whether the response from the model is complete.
       Only used for streaming mode.
@@ -69,7 +69,7 @@ class LlmResponse(BaseModel):
   """The grounding metadata of the response."""
 
   partial: Optional[bool] = None
-  """Indicates whether the text content is part of a unfinished text stream.
+  """Indicates whether the text content is part of an unfinished text stream.
 
   Only used for streaming mode and when the content is plain text.
   """
@@ -133,6 +133,13 @@ class LlmResponse(BaseModel):
   """Citation metadata for the response.
 
   This field is automatically populated when citation is enabled.
+  """
+
+  interaction_id: Optional[str] = None
+  """The interaction ID from the interactions API.
+
+  This field is populated when using the interactions API for model invocation.
+  It can be used to identify and chain interactions for stateful conversations.
   """
 
   @staticmethod
