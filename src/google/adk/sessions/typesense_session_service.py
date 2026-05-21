@@ -201,10 +201,30 @@ class TypesenseSessionService(BaseSessionService):
   def _deserialize_actions(
       self, actions_str: Optional[str]
   ) -> Optional[EventActions]:
-    """Deserializes EventActions from a JSON string."""
+    """Deserializes EventActions from its stored string.
+
+    The current format is JSON (see `_serialize_actions`). Legacy events
+    stored `actions` as a base64-encoded pickle, so fall back to that format
+    when JSON parsing fails — otherwise a single old event poisons the whole
+    session load and the run aborts with a pydantic ``json_invalid`` error.
+    If neither format decodes, drop the actions for that one event rather
+    than failing the entire session.
+    """
     if not actions_str:
       return None
-    return EventActions.model_validate_json(actions_str)
+    try:
+      return EventActions.model_validate_json(actions_str)
+    except ValueError:
+      # Legacy format: base64-encoded pickle of an EventActions instance.
+      try:
+        return pickle.loads(base64.b64decode(actions_str))
+      except Exception as e:  # noqa: BLE001 — never let one bad event abort load
+        logger.warning(
+            "Could not deserialize EventActions; dropping actions for this"
+            " event: %s",
+            e,
+        )
+        return None
 
   def _get_app_state(self, app_name: str) -> dict[str, Any]:
     """Fetches app state from Typesense."""
