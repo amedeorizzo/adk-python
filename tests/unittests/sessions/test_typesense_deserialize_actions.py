@@ -47,3 +47,22 @@ def test_deserialize_garbage_is_dropped_not_raised():
   svc = _service()
   # Neither valid JSON nor a valid base64 pickle → drop actions, never raise.
   assert svc._deserialize_actions("!!! not json, not a pickle !!!") is None
+
+
+def test_deserialize_legacy_pickle_missing_newer_field():
+  """An old pickle predating a newer field must be re-validated so the field
+  is restored with its default (otherwise accessing it AttributeErrors)."""
+  svc = _service()
+  actions = EventActions(transfer_to_agent="data_scientist")
+  # Simulate an older schema: drop a field the current model defines.
+  legacy = pickle.loads(pickle.dumps(actions))
+  assert hasattr(legacy, "rewind_before_invocation_id")
+  legacy.__dict__.pop("rewind_before_invocation_id", None)
+  encoded = base64.b64encode(pickle.dumps(legacy)).decode("ascii")
+
+  out = svc._deserialize_actions(encoded)
+  assert out is not None
+  assert out.transfer_to_agent == "data_scientist"
+  # The field missing from the old pickle is restored (default) — no
+  # AttributeError when the ADK accesses it.
+  assert out.rewind_before_invocation_id is None

@@ -215,16 +215,33 @@ class TypesenseSessionService(BaseSessionService):
     try:
       return EventActions.model_validate_json(actions_str)
     except ValueError:
-      # Legacy format: base64-encoded pickle of an EventActions instance.
-      try:
-        return pickle.loads(base64.b64decode(actions_str))
-      except Exception as e:  # noqa: BLE001 — never let one bad event abort load
-        logger.warning(
-            "Could not deserialize EventActions; dropping actions for this"
-            " event: %s",
-            e,
-        )
-        return None
+      pass
+    # Legacy format: base64-encoded pickle of an EventActions instance. The
+    # unpickled object may be an OLDER schema (missing fields added since,
+    # e.g. `rewind_before_invocation_id`), which would AttributeError when
+    # accessed later. Re-validate it through the CURRENT model so new fields
+    # are populated with their defaults.
+    try:
+      legacy = pickle.loads(base64.b64decode(actions_str))
+    except Exception as e:  # noqa: BLE001 — never let one bad event abort load
+      logger.warning(
+          "Could not decode legacy EventActions; dropping actions for this"
+          " event: %s",
+          e,
+      )
+      return None
+    try:
+      if isinstance(legacy, EventActions):
+        return EventActions.model_validate(legacy.__dict__)
+      if isinstance(legacy, dict):
+        return EventActions.model_validate(legacy)
+    except Exception as e:  # noqa: BLE001
+      logger.warning(
+          "Could not normalize legacy EventActions; dropping actions for this"
+          " event: %s",
+          e,
+      )
+    return None
 
   def _get_app_state(self, app_name: str) -> dict[str, Any]:
     """Fetches app state from Typesense."""
