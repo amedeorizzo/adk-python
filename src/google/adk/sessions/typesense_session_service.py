@@ -403,24 +403,42 @@ class TypesenseSessionService(BaseSessionService):
       after_micro = self._to_microseconds(config.after_timestamp)
       event_filter += f" && timestamp:>={after_micro}"
 
-    # Search for events
-    event_search_params = {
-        "q": "*",
-        "filter_by": event_filter,
-        "sort_by": "timestamp:desc",
-    }
-    if config and config.num_recent_events:
-      event_search_params["per_page"] = config.num_recent_events
+    # num_recent_events semantics:
+    #   None  -> load all events (Typesense default page applies)
+    #   N > 0 -> load the N most recent events
+    #   0     -> load NO event history (state-only). Callers that want a
+    #            stateless-per-turn request (keix-agent passes 0) rely on
+    #            this; treating 0 as falsy here previously fell through to
+    #            Typesense's default page (10 events), replaying stale turns
+    #            and breaking Gemini with malformed function_call ordering.
+    num_recent_events = config.num_recent_events if config else None
 
-    event_results = self.client.collections["events"].documents.search(
-        event_search_params
-    )
+    if num_recent_events == 0:
+      events = []
+    else:
+      event_search_params = {
+          "q": "*",
+          "filter_by": event_filter,
+          "sort_by": "timestamp:desc",
+      }
+      if num_recent_events:
+        event_search_params["per_page"] = num_recent_events
 
-    # Convert events
-    events = []
-    for hit in reversed(event_results["hits"]):
-      event_doc = hit["document"]
-      events.append(self._document_to_event(event_doc))
+      event_results = self.client.collections["events"].documents.search(
+          event_search_params
+      )
+
+      # Convert events
+      events = []
+      for hit in reversed(event_results["hits"]):
+        event_doc = hit["document"]
+        events.append(self._document_to_event(event_doc))
+
+      # Sanitize so the (possibly windowed / interrupted) history satisfies
+      # Gemini's content-ordering rules — otherwise the next turn dies with
+      # "400 INVALID_ARGUMENT: function call turn must come immediately after
+      # a user turn or after a function response turn".
+      events = self._sanitize_events_for_gemini(events)
 
     # Fetch states
     app_state = self._get_app_state(app_name)
@@ -641,6 +659,135 @@ class TypesenseSessionService(BaseSessionService):
       doc["interrupted"] = event.interrupted
 
     return doc
+
+  def _sanitize_events_for_gemini(self, events: list[Event]) -> list[Event]:
+    """Make a loaded event list satisfy Gemini's content-ordering rules.
+
+    A session loaded from Typesense can break the next LLM turn with
+    `400 INVALID_ARGUMENT: function call turn must come immediately after a
+    user turn or after a function response turn`. Two causes:
+
+    1. A `function_call` with no matching `function_response` (an interrupted
+       run), or an orphan `function_response` — common when a prior turn
+       errored or was windowed by the recent-events page limit.
+    2. Two consecutive `model` turns (e.g. a narration text turn followed by a
+       separate `function_call` turn), which leaves the `function_call`
+       preceded by a model turn rather than a user/function_response turn.
+    3. A history window that begins with a model/function turn instead of a
+       user turn.
+
+    We drop unmatched call/response parts, drop any event left empty, merge
+    consecutive model-role contents, then trim leading non-user turns.
+    """
+    if not events:
+      return events
+
+    def parts_of(e: Event):
+      return e.content.parts if (e.content and e.content.parts) else []
+
+    def summarize(es: list[Event]) -> str:
+      out = []
+      for e in es:
+        role = (e.content.role if e.content else None) or "?"
+        kinds = []
+        for p in parts_of(e):
+          fc = getattr(p, "function_call", None)
+          fr = getattr(p, "function_response", None)
+          if fc is not None:
+            kinds.append(f"call({getattr(fc, 'name', '?')}:{getattr(fc, 'id', '?')})")
+          elif fr is not None:
+            kinds.append(f"resp({getattr(fr, 'name', '?')}:{getattr(fr, 'id', '?')})")
+          elif getattr(p, "text", None):
+            kinds.append("text")
+          else:
+            kinds.append("?")
+        out.append(f"{role}[{','.join(kinds) or 'empty'}]")
+      return " | ".join(out)
+
+    import logging as _lg
+    _log = _lg.getLogger(__name__)
+    _log.debug("[SANITIZE] IN  (%d events): %s", len(events), summarize(events))
+
+    # 1. Pair function_call <-> function_response by id.
+    call_ids: set[str] = set()
+    resp_ids: set[str] = set()
+    for e in events:
+      for p in parts_of(e):
+        fc = getattr(p, "function_call", None)
+        fr = getattr(p, "function_response", None)
+        if fc is not None and getattr(fc, "id", None):
+          call_ids.add(fc.id)
+        if fr is not None and getattr(fr, "id", None):
+          resp_ids.add(fr.id)
+    matched = call_ids & resp_ids
+
+    # 2. Drop parts whose call/response id has no pair; drop empty events.
+    cleaned: list[Event] = []
+    for e in events:
+      ps = parts_of(e)
+      if not ps:
+        cleaned.append(e)
+        continue
+      kept = []
+      for p in ps:
+        fc = getattr(p, "function_call", None)
+        fr = getattr(p, "function_response", None)
+        if fc is not None and getattr(fc, "id", None) and fc.id not in matched:
+          continue
+        if fr is not None and getattr(fr, "id", None) and fr.id not in matched:
+          continue
+        kept.append(p)
+      if not kept:
+        continue
+      e.content.parts = kept
+      cleaned.append(e)
+
+    # 3. Merge consecutive model-role contents into one (avoids model→model).
+    merged: list[Event] = []
+    for e in cleaned:
+      if (
+          merged
+          and e.content
+          and merged[-1].content
+          and (e.content.role or "model") == "model"
+          and (merged[-1].content.role or "model") == "model"
+      ):
+        merged[-1].content.parts = list(parts_of(merged[-1])) + list(parts_of(e))
+        continue
+      merged.append(e)
+
+    # 4. Trim leading turns until the history starts on a real user turn —
+    #    a window that opens on a model/function_call turn is itself invalid.
+    #    Critically: when we pop a leading model turn that carried a
+    #    function_call, ALSO pop any immediately-following user turn that is
+    #    purely the matching function_response — otherwise we leave an orphan
+    #    response at the head and Gemini still rejects with the same 400.
+    popped_call_ids: set[str] = set()
+    while merged and merged[0].content:
+      head = merged[0]
+      role = (head.content.role or "model") if head.content else "model"
+      if role == "user":
+        ps = parts_of(head)
+        # If every part is a function_response whose id matches a call we
+        # already popped, this content is an orphan — drop it too.
+        if ps and all(
+            getattr(p, "function_response", None)
+            and getattr(p.function_response, "id", None) in popped_call_ids
+            for p in ps
+        ):
+          merged.pop(0)
+          continue
+        break
+      # Non-user head: remember its call ids so the next iteration can pop
+      # matched orphan responses, then drop it.
+      for p in parts_of(head):
+        fc = getattr(p, "function_call", None)
+        if fc is not None and getattr(fc, "id", None):
+          popped_call_ids.add(fc.id)
+      merged.pop(0)
+
+    _log.debug("[SANITIZE] OUT (%d events): %s", len(merged), summarize(merged))
+    return merged
 
   def _document_to_event(self, doc: dict[str, Any]) -> Event:
     """Converts a Typesense document to an Event object."""
