@@ -708,20 +708,19 @@ class TypesenseSessionService(BaseSessionService):
     _log = _lg.getLogger(__name__)
     _log.debug("[SANITIZE] IN  (%d events): %s", len(events), summarize(events))
 
-    # 1. Pair function_call <-> function_response by id.
-    call_ids: set[str] = set()
-    resp_ids: set[str] = set()
-    for e in events:
-      for p in parts_of(e):
-        fc = getattr(p, "function_call", None)
-        fr = getattr(p, "function_response", None)
-        if fc is not None and getattr(fc, "id", None):
-          call_ids.add(fc.id)
-        if fr is not None and getattr(fr, "id", None):
-          resp_ids.add(fr.id)
-    matched = call_ids & resp_ids
-
-    # 2. Drop parts whose call/response id has no pair; drop empty events.
+    # 1+2. Drop ALL function_call/function_response parts from loaded history,
+    #    not just unmatched ones. Loaded history exists to give the next turn
+    #    CONVERSATIONAL memory (what was asked, what was answered, the
+    #    analyst's WORKFLOW_STEPS block, …) — replaying tool mechanics buys
+    #    nothing, bloats the prompt, and is the #1 source of Gemini's
+    #    content-ordering 400s. Text-only history also survives windowing:
+    #    previously, a recent-events window that opened mid tool-chain got
+    #    trimmed back to the first user turn (step 4) — and when the turn's
+    #    user message fell OUTSIDE the window, the ENTIRE prior turn was
+    #    discarded. Observed live: 'salva l'analisi appena svolta' found no
+    #    analysis in memory because the analysis turn's 27 tool events had
+    #    pushed its user message out of the window, so everything was
+    #    trimmed.
     cleaned: list[Event] = []
     for e in events:
       ps = parts_of(e)
@@ -732,9 +731,7 @@ class TypesenseSessionService(BaseSessionService):
       for p in ps:
         fc = getattr(p, "function_call", None)
         fr = getattr(p, "function_response", None)
-        if fc is not None and getattr(fc, "id", None) and fc.id not in matched:
-          continue
-        if fr is not None and getattr(fr, "id", None) and fr.id not in matched:
+        if fc is not None or fr is not None:
           continue
         kept.append(p)
       if not kept:
@@ -756,34 +753,14 @@ class TypesenseSessionService(BaseSessionService):
         continue
       merged.append(e)
 
-    # 4. Trim leading turns until the history starts on a real user turn —
-    #    a window that opens on a model/function_call turn is itself invalid.
-    #    Critically: when we pop a leading model turn that carried a
-    #    function_call, ALSO pop any immediately-following user turn that is
-    #    purely the matching function_response — otherwise we leave an orphan
-    #    response at the head and Gemini still rejects with the same 400.
-    popped_call_ids: set[str] = set()
-    while merged and merged[0].content:
-      head = merged[0]
-      role = (head.content.role or "model") if head.content else "model"
-      if role == "user":
-        ps = parts_of(head)
-        # If every part is a function_response whose id matches a call we
-        # already popped, this content is an orphan — drop it too.
-        if ps and all(
-            getattr(p, "function_response", None)
-            and getattr(p.function_response, "id", None) in popped_call_ids
-            for p in ps
-        ):
-          merged.pop(0)
-          continue
-        break
-      # Non-user head: remember its call ids so the next iteration can pop
-      # matched orphan responses, then drop it.
-      for p in parts_of(head):
-        fc = getattr(p, "function_call", None)
-        if fc is not None and getattr(fc, "id", None):
-          popped_call_ids.add(fc.id)
+    # 4. With every function part stripped in step 2, the history is pure
+    #    text turns — Gemini's "function call must follow user/function
+    #    response" rule can no longer be violated, and a window that opens on
+    #    a model TEXT turn is valid. So we no longer trim leading model
+    #    turns (the old trim threw away the entire previous turn whenever
+    #    its user message fell outside the recent-events window). Keep one
+    #    defensive pass: drop any leading event with no parts at all.
+    while merged and not parts_of(merged[0]):
       merged.pop(0)
 
     _log.debug("[SANITIZE] OUT (%d events): %s", len(merged), summarize(merged))
