@@ -184,6 +184,22 @@ class TypesenseSessionService(BaseSessionService):
     """Creates a composite key for Typesense document ID."""
     return ":".join(parts)
 
+  def _get_document(
+      self, collection: str, doc_id: str
+  ) -> Optional[dict[str, Any]]:
+    """Direct document lookup by id (the composite key IS the doc id).
+
+    Reads the document store, so a doc is visible immediately after its own
+    write returns. The SEARCH index lags writes by a beat — looking up a
+    just-created session via ``documents.search`` lost that race and surfaced
+    as ``Session not found: <id>`` (Runner re-fetches the session right after
+    ``create_session``) on the FIRST message of a brand-new chat.
+    """
+    try:
+      return self.client.collections[collection].documents[doc_id].retrieve()
+    except typesense.exceptions.ObjectNotFound:
+      return None
+
   def _to_microseconds(self, timestamp: float) -> int:
     """Converts Unix timestamp to microseconds."""
     return int(timestamp * 1_000_000)
@@ -244,33 +260,15 @@ class TypesenseSessionService(BaseSessionService):
     return None
 
   def _get_app_state(self, app_name: str) -> dict[str, Any]:
-    """Fetches app state from Typesense."""
-    try:
-      search_results = self.client.collections["app_states"].documents.search({
-          "q": "*",
-          "filter_by": f"app_name:={app_name}",
-          "per_page": 1,
-      })
-      if search_results["found"] > 0:
-        return search_results["hits"][0]["document"]["state"]
-      return {}
-    except typesense.exceptions.ObjectNotFound:
-      return {}
+    """Fetches app state from Typesense (direct id lookup — see _get_document)."""
+    doc = self._get_document("app_states", app_name)
+    return doc["state"] if doc else {}
 
   def _get_user_state(self, app_name: str, user_id: str) -> dict[str, Any]:
-    """Fetches user state from Typesense."""
-    try:
-      composite_key = self._make_composite_key(app_name, user_id)
-      search_results = self.client.collections["user_states"].documents.search({
-          "q": "*",
-          "filter_by": f"composite_key:={composite_key}",
-          "per_page": 1,
-      })
-      if search_results["found"] > 0:
-        return search_results["hits"][0]["document"]["state"]
-      return {}
-    except typesense.exceptions.ObjectNotFound:
-      return {}
+    """Fetches user state from Typesense (direct id lookup — see _get_document)."""
+    composite_key = self._make_composite_key(app_name, user_id)
+    doc = self._get_document("user_states", composite_key)
+    return doc["state"] if doc else {}
 
   def _upsert_app_state(self, app_name: str, state: dict[str, Any]):
     """Updates or inserts app state in Typesense."""
@@ -379,19 +377,13 @@ class TypesenseSessionService(BaseSessionService):
       config: Optional[GetSessionConfig] = None,
   ) -> Optional[Session]:
     """Gets a session."""
-    # Search for session
+    # Direct id lookup (doc id == composite key). A search-based lookup here
+    # raced the create: the Runner re-fetches the session right after
+    # create_session, before the search index caught up, and the first
+    # message of a new chat died with "Session not found".
     composite_key = self._make_composite_key(app_name, user_id, session_id)
-    try:
-      search_results = self.client.collections["sessions"].documents.search({
-          "q": "*",
-          "filter_by": f"composite_key:={composite_key}",
-          "per_page": 1,
-      })
-      if search_results["found"] == 0:
-        return None
-
-      session_doc = search_results["hits"][0]["document"]
-    except typesense.exceptions.ObjectNotFound:
+    session_doc = self._get_document("sessions", composite_key)
+    if session_doc is None:
       return None
 
     # Build event filter
@@ -545,28 +537,23 @@ class TypesenseSessionService(BaseSessionService):
     composite_key = self._make_composite_key(
         session.app_name, session.user_id, session.id
     )
-    try:
-      search_results = self.client.collections["sessions"].documents.search({
-          "q": "*",
-          "filter_by": f"composite_key:={composite_key}",
-          "per_page": 1,
-      })
-      if search_results["found"] == 0:
-        raise ValueError(f"Session {session.id} not found")
-
-      session_doc = search_results["hits"][0]["document"]
-      stored_update_time = self._from_microseconds(session_doc["update_time"])
-
-      if stored_update_time > session.last_update_time:
-        raise ValueError(
-            "The last_update_time provided in the session object"
-            f" {datetime.fromtimestamp(session.last_update_time):%Y-%m-%d %H:%M:%S} is"
-            " earlier than the update_time in storage"
-            f" {datetime.fromtimestamp(stored_update_time):%Y-%m-%d %H:%M:%S}."
-            " Please check if it is a stale session."
-        )
-    except typesense.exceptions.ObjectNotFound:
+    # Direct id lookup (doc id == composite key) — same read-your-own-write
+    # rationale as get_session: the first append after create_session must
+    # never miss the session because the search index hasn't caught up.
+    session_doc = self._get_document("sessions", composite_key)
+    if session_doc is None:
       raise ValueError(f"Session {session.id} not found")
+
+    stored_update_time = self._from_microseconds(session_doc["update_time"])
+
+    if stored_update_time > session.last_update_time:
+      raise ValueError(
+          "The last_update_time provided in the session object"
+          f" {datetime.fromtimestamp(session.last_update_time):%Y-%m-%d %H:%M:%S} is"
+          " earlier than the update_time in storage"
+          f" {datetime.fromtimestamp(stored_update_time):%Y-%m-%d %H:%M:%S}."
+          " Please check if it is a stale session."
+      )
 
     # Fetch states
     app_state = self._get_app_state(session.app_name)
