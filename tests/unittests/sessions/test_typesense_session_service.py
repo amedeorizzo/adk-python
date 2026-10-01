@@ -7,13 +7,16 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import copy
+import threading
 from types import SimpleNamespace
 from unittest import mock
 
 from google.adk.errors.already_exists_error import AlreadyExistsError
 from google.adk.events.event import Event
 from google.adk.events.event_actions import EventActions
+from google.adk.sessions import typesense_session_service
 from google.adk.sessions.base_session_service import GetSessionConfig
 from google.adk.sessions.typesense_session_service import EVENTS_SCHEMA
 from google.adk.sessions.typesense_session_service import TypesenseSessionService
@@ -365,6 +368,145 @@ def test_schema_upgrade_adds_only_optional_unindexed_event_json():
   collections['events'].update.reset_mock()
   service._initialize_collections()
   collections['events'].update.assert_not_called()
+
+
+def _schema_initializer(events):
+  service = object.__new__(TypesenseSessionService)
+  collections = mock.MagicMock()
+  by_name = {
+      name: mock.Mock()
+      for name in ('sessions', 'events', 'app_states', 'user_states')
+  }
+  for collection in by_name.values():
+    collection.retrieve.return_value = {'fields': []}
+  by_name['events'] = events
+  collections.__getitem__.side_effect = by_name.__getitem__
+  service.client = SimpleNamespace(collections=collections)
+  return service
+
+
+def _busy_schema_update():
+  return typesense.exceptions.ObjectUnprocessable(
+      422, 'Another collection update operation is in progress'
+  )
+
+
+def test_schema_busy_retry_rereads_delayed_field_without_repeating_update():
+  field = next(f for f in EVENTS_SCHEMA['fields'] if f['name'] == 'event_json')
+  events = mock.Mock()
+  events.retrieve.side_effect = [
+      {'fields': []},
+      {'fields': []},
+      {'fields': [field]},
+  ]
+  events.update.side_effect = _busy_schema_update()
+  service = _schema_initializer(events)
+  with mock.patch.object(typesense_session_service.time, 'sleep') as sleep:
+    service._initialize_collections()
+  assert events.retrieve.call_count == 3
+  assert events.update.call_count == 2
+  assert sleep.call_args_list == [mock.call(0.1), mock.call(0.2)]
+  events.retrieve.side_effect = None
+  events.retrieve.return_value = {'fields': [field]}
+  service._initialize_collections()
+  assert events.update.call_count == 2
+
+
+def test_concurrent_schema_initializers_complete_one_migration():
+  field = next(f for f in EVENTS_SCHEMA['fields'] if f['name'] == 'event_json')
+  started, release, completed = (threading.Event() for _ in range(3))
+  fields = []
+  events = mock.Mock()
+  events.retrieve.side_effect = lambda: {'fields': copy.deepcopy(fields)}
+
+  def update(_schema):
+    if started.is_set():
+      raise _busy_schema_update()
+    started.set()
+    assert release.wait(timeout=2)
+    fields.append(field)
+    completed.set()
+
+  events.update.side_effect = update
+  service = _schema_initializer(events)
+  second = object.__new__(TypesenseSessionService)
+  second.client = service.client
+
+  def await_other_initializer(_delay):
+    release.set()
+    assert completed.wait(timeout=2)
+
+  with mock.patch.object(
+      typesense_session_service.time,
+      'sleep',
+      side_effect=await_other_initializer,
+  ):
+    with ThreadPoolExecutor(max_workers=2) as pool:
+      first = pool.submit(service._initialize_collections)
+      assert started.wait(timeout=2)
+      other = pool.submit(second._initialize_collections)
+      first.result(timeout=2)
+      other.result(timeout=2)
+  assert fields == [field]
+  assert events.update.call_count == 2  # One write and one busy conflict.
+  service._initialize_collections()
+  assert events.update.call_count == 2
+
+
+def test_schema_busy_exhaustion_propagates_original_error():
+  events = mock.Mock()
+  events.retrieve.return_value = {'fields': []}
+  busy = _busy_schema_update()
+  events.update.side_effect = busy
+  service = _schema_initializer(events)
+  with mock.patch.object(typesense_session_service.time, 'sleep') as sleep:
+    with pytest.raises(typesense.exceptions.ObjectUnprocessable) as raised:
+      service._initialize_collections()
+  assert raised.value is busy
+  assert events.update.call_count == events.retrieve.call_count == 8
+  assert sleep.call_count == 7
+  assert sum(call.args[0] for call in sleep.call_args_list) == 4.5
+
+
+@pytest.mark.parametrize(
+    'error',
+    [
+        typesense.exceptions.ObjectUnprocessable(422, 'Invalid field schema'),
+        typesense.exceptions.ObjectUnprocessable(
+            400, 'Another collection update operation is in progress'
+        ),
+        typesense.exceptions.RequestForbidden(403, 'Forbidden'),
+    ],
+)
+def test_schema_non_concurrency_errors_are_not_retried(error):
+  events = mock.Mock()
+  events.retrieve.return_value = {'fields': []}
+  events.update.side_effect = error
+  with mock.patch.object(typesense_session_service.time, 'sleep') as sleep:
+    with pytest.raises(type(error)) as raised:
+      _schema_initializer(events)._initialize_collections()
+  assert raised.value is error
+  events.update.assert_called_once()
+  sleep.assert_not_called()
+
+
+def test_collection_creation_collision_rereads_until_schema_visible():
+  events = mock.Mock()
+  events.retrieve.side_effect = [
+      typesense.exceptions.ObjectNotFound(404, 'Not found'),
+      typesense.exceptions.ObjectNotFound(404, 'Not found'),
+      {'fields': EVENTS_SCHEMA['fields']},
+  ]
+  service = _schema_initializer(events)
+  service.client.collections.create.side_effect = (
+      typesense.exceptions.ObjectAlreadyExists(409, 'Already exists')
+  )
+  with mock.patch.object(typesense_session_service.time, 'sleep') as sleep:
+    service._initialize_collections()
+  assert service.client.collections.create.call_count == 2
+  assert events.retrieve.call_count == 3
+  events.update.assert_not_called()
+  assert sleep.call_count == 2
 
 
 @pytest.mark.asyncio

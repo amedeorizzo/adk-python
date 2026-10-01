@@ -22,6 +22,7 @@ import io
 import json
 import logging
 import pickle
+import time
 from typing import Any
 from typing import Optional
 import uuid
@@ -41,6 +42,9 @@ from .base_session_service import ListSessionsResponse
 from .session import Session
 
 logger = logging.getLogger("google_adk." + __name__)
+
+_COLLECTION_INIT_ATTEMPTS = 8
+_COLLECTION_UPDATE_BUSY = "Another collection update operation is in progress"
 
 # Typesense collection schemas
 SESSIONS_SCHEMA = {
@@ -246,21 +250,37 @@ class TypesenseSessionService(BaseSessionService):
       ) from e
 
   def _initialize_collections(self):
-    """Creates Typesense collections if they don't exist."""
+    """Create/migrate collections, tolerating bounded concurrent startup races."""
     for schema in [
         SESSIONS_SCHEMA,
         EVENTS_SCHEMA,
         APP_STATES_SCHEMA,
         USER_STATES_SCHEMA,
     ]:
-      collection_name = schema["name"]
+      self._ensure_collection(schema)
+
+  def _ensure_collection(self, schema: dict[str, Any]) -> None:
+    collection_name = schema["name"]
+    collection = self.client.collections[collection_name]
+    for attempt in range(_COLLECTION_INIT_ATTEMPTS):
       try:
-        existing = self.client.collections[collection_name].retrieve()
-        if collection_name == "events" and not any(
+        existing = collection.retrieve()
+      except typesense.exceptions.ObjectNotFound:
+        try:
+          self.client.collections.create(schema)
+          logger.info("Created collection '%s'", collection_name)
+          return
+        except typesense.exceptions.ObjectAlreadyExists:
+          if attempt == _COLLECTION_INIT_ATTEMPTS - 1:
+            raise
+      else:
+        if collection_name != "events" or any(
             field["name"] == "event_json"
             for field in existing.get("fields", [])
         ):
-          self.client.collections[collection_name].update({
+          return
+        try:
+          collection.update({
               "fields": [
                   next(
                       field
@@ -269,10 +289,17 @@ class TypesenseSessionService(BaseSessionService):
                   )
               ]
           })
-        logger.debug("Collection '%s' already exists", collection_name)
-      except typesense.exceptions.ObjectNotFound:
-        self.client.collections.create(schema)
-        logger.info("Created collection '%s'", collection_name)
+          return
+        except typesense.exceptions.ObjectUnprocessable as exc:
+          if (
+              exc.errno != 422
+              or _COLLECTION_UPDATE_BUSY not in str(exc)
+              or attempt == _COLLECTION_INIT_ATTEMPTS - 1
+          ):
+            raise
+      # A competing initializer may have completed since the conflict. Always
+      # re-read its schema before deciding whether another update is necessary.
+      time.sleep(min(0.1 * 2**attempt, 1.0))
 
   def _make_composite_key(self, *parts: str) -> str:
     """Creates a composite key for Typesense document ID."""
