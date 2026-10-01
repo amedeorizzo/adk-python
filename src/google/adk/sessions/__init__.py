@@ -24,6 +24,7 @@ from .state import State
 if TYPE_CHECKING:
   from .database_session_service import DatabaseSessionService
   from .in_memory_session_service import InMemorySessionService
+  from .typesense_session_service import TypesenseSessionService
   from .vertex_ai_session_service import VertexAiSessionService
 
 __all__ = [
@@ -32,12 +33,14 @@ __all__ = [
     'InMemorySessionService',
     'Session',
     'State',
+    'TypesenseSessionService',
     'VertexAiSessionService',
 ]
 
 _LAZY_MEMBERS: dict[str, str] = {
     'InMemorySessionService': 'in_memory_session_service',
     'VertexAiSessionService': 'vertex_ai_session_service',
+    'TypesenseSessionService': 'typesense_session_service',
 }
 
 

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 from typing import Optional
 from typing import Type
@@ -48,3 +49,31 @@ def extract_state_delta(
       elif not key.startswith(State.TEMP_PREFIX):
         deltas["session"][key] = state[key]
   return deltas
+
+
+def _merge_state(app_state, user_state, session_state):
+  # Merge states for response
+  merged_state = copy.deepcopy(session_state)
+  for key in app_state.keys():
+    merged_state[State.APP_PREFIX + key] = app_state[key]
+  for key in user_state.keys():
+    merged_state[State.USER_PREFIX + key] = user_state[key]
+  return merged_state
+
+
+def decode_content(content_data: Optional[Any]) -> Optional[Any]:
+  """Decodes content from storage format.
+
+  For backward compatibility with old sessions that may have stored
+  content in a different format. Currently just returns the data as-is.
+  """
+  return content_data
+
+
+def decode_grounding_metadata(metadata: Optional[Any]) -> Optional[Any]:
+  """Decodes grounding metadata from storage format.
+
+  For backward compatibility with old sessions that may have stored
+  grounding metadata in a different format. Currently just returns the data as-is.
+  """
+  return metadata
