@@ -246,6 +246,10 @@ from the official tag. The Typesense service is not the backend exercised by
 that failing test. The full ADK suite and all optional cloud integrations
 have not been certified.
 
-Read-only Keix Sonnet transport verification using LiteLLM 1.83.14 and Anthropic
-1.11.0 passes one of six adapter tests; the other five expose the signed-thought
-compatibility gap above. These are mocked HTTP tests and spend no API credit.
+The paired Keix-agent integration candidate now replaces native thought parts
+with one validated replay packet and preserves signed complete tool turns when
+restoring full Typesense history. With LiteLLM 1.83.14, all nine adapter tests and
+seven restored-history tests pass, including two fresh Runner instances and the
+real Typesense serializer. The transport is mocked and spends no API credit.
+This fix is in Keix-agent, not in this fork: promote the two changes together.
+The old Keix `<1.75` LiteLLM bound must also be updated before that promotion.
