@@ -741,7 +741,24 @@ class TypesenseSessionService(BaseSessionService):
     if event.branch:
       doc["branch"] = event.branch
     if event.content:
-      doc["content"] = serialized["content"]
+      # Older readers discard tool mechanics but retain opaque thought parts.
+      # Keep their compatibility view free of provider transport signatures;
+      # event_json above remains the full-fidelity source for current readers.
+      legacy_content = dict(serialized["content"])
+      legacy_parts = []
+      for part in legacy_content.get("parts", []):
+        if part.get("thought"):
+          continue
+        legacy_part = {
+            key: value
+            for key, value in part.items()
+            if key != "thought_signature"
+        }
+        if any(key != "thought" for key in legacy_part):
+          legacy_parts.append(legacy_part)
+      if legacy_parts:
+        legacy_content["parts"] = legacy_parts
+        doc["content"] = legacy_content
     if event.grounding_metadata:
       doc["grounding_metadata"] = serialized["grounding_metadata"]
     if event.custom_metadata:
